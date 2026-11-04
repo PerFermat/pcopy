@@ -1,5 +1,6 @@
 """Tabellenmodell, Fortschrittsbalken und Drop-Tabelle."""
 import os
+import time
 
 from .qt import Qt, QtCore, QtGui, QtWidgets
 from .util import hsize, htime
@@ -33,8 +34,9 @@ class JobModel(QtCore.QAbstractTableModel):
     def load(self, c):
         self.beginResetModel()
         self.rows = [dict(id=r[0], src=r[1], dst=r[2], size=r[3] or 0, offset=r[4] or 0, status=r[5], error=r[6],
-                          speed=r[7], hash=r[8])
-                     for r in c.execute("SELECT id,src,dst,size,offset,status,error,speed,hash FROM jobs ORDER BY id")]
+                          speed=r[7], hash=r[8], tries=r[9] or 0, retry_at=r[10])
+                     for r in c.execute("SELECT id,src,dst,size,offset,status,error,speed,hash,tries,retry_at "
+                                        "FROM jobs ORDER BY id")]
         self.idx = {r["id"]: i for i, r in enumerate(self.rows)}
         self.live.clear()
         self.endResetModel()
@@ -70,6 +72,9 @@ class JobModel(QtCore.QAbstractTableModel):
             self.live.pop(jid, None)
         self.dataChanged.emit(self.index(i, 0), self.index(i, len(COLS) - 1))
 
+    def refresh(self, i, col):
+        self.dataChanged.emit(self.index(i, col), self.index(i, col))
+
     def set_live(self, jid, copied, speed, verified=None):
         i = self.idx.get(jid)
         if i is None:
@@ -101,6 +106,9 @@ class JobModel(QtCore.QAbstractTableModel):
             if col == 3:
                 return ("prüft " if st in ("verifying", "checking") else "") + f"{frac * 100:.1f} %".replace(".", ",")
             if col == 4:
+                if st == "pending" and r.get("retry_at"):
+                    wait = r["retry_at"] - time.time()
+                    return f"Wiederholung in {int(wait) + 1} s" if wait > 0 else f"Versuch {r['tries'] + 1} wartet"
                 if st == "pending" and r["offset"]:
                     return "pausiert"
                 if st == "done" and r.get("hash"):
@@ -121,6 +129,8 @@ class JobModel(QtCore.QAbstractTableModel):
                 t += f"\nSHA-256: {r['hash']}\n(nach dem Kopieren von der Platte gelesen und verglichen)"
             return t + (f"\nFehler: {r['error']}" if r.get("error") else "")
         elif role == Qt.ItemDataRole.ForegroundRole and col == 4:
+            if st == "pending" and r.get("retry_at"):
+                return QtGui.QBrush(QtGui.QColor("#d08a1c"))
             return QtGui.QBrush(QtGui.QColor({"done": "#2e9e44", "failed": "#d0342c", "running": "#2a7ad5", "skipped": "#2e9e44",
                                               "written": "#2a7ad5", "verifying": "#2a7ad5",
                                               "checking": "#2a7ad5", "check_wait": "#2a7ad5"}

@@ -10,7 +10,7 @@ from .scanner import keep_existing
 
 class ListMixin:
     def retry_failed(self):
-        self.db.execute("UPDATE jobs SET status='pending', error=NULL WHERE status='failed'")
+        self.db.execute("UPDATE jobs SET status='pending', error=NULL, tries=0, retry_at=NULL WHERE status='failed'")
         self.model.load(self.db)
 
     def clear_done(self):

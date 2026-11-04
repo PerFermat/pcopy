@@ -19,6 +19,9 @@ class MenuMixin:
                         lambda: self.target.text() and QtGui.QDesktopServices.openUrl(
                             QtCore.QUrl.fromLocalFile(self.target.text()))))
         m.addSeparator()
+        m.addAction(act("Bericht…", "document-properties", self.show_report,
+                        "Zusammenfassung, Fehler und übersprungene Dateien – speicherbar als Text oder CSV", "Ctrl+B"))
+        m.addSeparator()
         m.addAction(act("Beenden", "application-exit", self.close, None, "Ctrl+Q"))
 
         m = mb.addMenu("&Kopieren")
@@ -109,7 +112,8 @@ class MenuMixin:
         elif chosen == a_check:
             self.check_selected()
         elif chosen == a_retry:
-            self.db.execute(f"UPDATE jobs SET status='pending', error=NULL WHERE status='failed' AND id IN ({q})", ids)
+            self.db.execute("UPDATE jobs SET status='pending', error=NULL, tries=0, retry_at=NULL "
+                            f"WHERE status='failed' AND id IN ({q})", ids)
             self.model.load(self.db)
         elif chosen == a_del:
             self.remove_selected()

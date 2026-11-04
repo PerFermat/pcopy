@@ -12,6 +12,7 @@ Ablauf pro Datei:
 Was beim Programmstart noch „written“ ist, war nicht sicher auf der Platte und wird neu kopiert."""
 import ctypes
 import ctypes.util
+import errno
 import hashlib
 import os
 import queue
@@ -27,6 +28,10 @@ SYNC_EVERY = 2.0          # s: Stand großer Dateien sichern / kleine Dateien ge
 SMALL = 8 * 1024 * 1024   # kleiner als das: kein fsync pro Datei, sondern gesammelt
 SYNC_FILES = 200          # spätestens nach so vielen kleinen Dateien syncen
 PART_SUFFIX = ".pcopy-part"
+RETRY_DELAYS = (10, 30, 60)   # s bis zum 2., 3., 4. Versuch bei vorübergehenden Fehlern
+# vorübergehend (z. B. USB-Reset, Netzlaufwerk hängt) – dauerhaft wären etwa ENOENT, EACCES, ENOSPC
+TRANSIENT = {errno.EIO, errno.ENXIO, errno.ENODEV, errno.ETIMEDOUT, errno.EAGAIN, errno.EBUSY,
+             errno.ESTALE, errno.ENOTCONN, errno.EINTR, errno.ECONNRESET, errno.EHOSTDOWN}
 
 try:
     _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
@@ -262,42 +267,39 @@ class Engine:
             if not batch:
                 return
             c = c or db_connect()
-            ok, bad = [], []                     # bad: (jid, part, fehlertext)
+            ok, bad = [], []                     # bad: (jid, part, fehlertext, wiederholen?)
             try:
                 self._sync_dirs(p for _, p, _, _ in batch)           # Daten sicher auf der Platte
                 for jid, part, dst, digest in batch:
                     try:
                         if digest is not None and not self._verify(part, digest):
-                            bad.append((jid, part, "Prüfung fehlgeschlagen: Ziel weicht von der Quelle ab"))
+                            bad.append((jid, part, "Prüfung fehlgeschlagen: Ziel weicht von der Quelle ab", True))
                             continue
                         os.replace(part, dst)
                         ok.append(jid)
                     except OSError as e:
-                        bad.append((jid, part, e.strerror or str(e)))
+                        bad.append((jid, part, e.strerror or str(e), e.errno in TRANSIENT))
                 if ok:
                     done = set(ok)
                     self._sync_dirs(dst for jid, _, dst, _ in batch if jid in done)       # Umbenennungen
             except OSError as e:
-                # nicht sicher geschrieben -> neu kopieren
-                ids = [(jid,) for jid, _, _, _ in batch]
-                c.executemany("UPDATE jobs SET status='pending', offset=0 WHERE id=? AND status='written'", ids)
-                for (jid,) in ids:
-                    self.events.put((jid, {"status": "pending", "offset": 0,
-                                           "error": f"Sichern fehlgeschlagen: {e.strerror or e}"}))
+                # nicht sicher geschrieben -> neu kopieren (bei vorübergehenden Fehlern später erneut)
+                for jid, _, _, _ in batch:
+                    self._fail(c, jid, f"Sichern fehlgeschlagen: {e.strerror or e}",
+                               retry=e.errno in TRANSIENT, restart=True)
                 return
             c.execute("BEGIN")
-            c.executemany("UPDATE jobs SET status='done' WHERE id=? AND status='written'", [(j,) for j in ok])
-            c.executemany("UPDATE jobs SET status='failed', offset=0, hash=NULL, error=? WHERE id=?",
-                          [(msg, jid) for jid, _, msg in bad])
+            c.executemany("UPDATE jobs SET status='done', tries=0, retry_at=NULL WHERE id=? AND status='written'",
+                          [(j,) for j in ok])
             c.execute("COMMIT")
             for jid in ok:
-                self.events.put((jid, {"status": "done"}))
-            for jid, part, msg in bad:
+                self.events.put((jid, {"status": "done", "tries": 0, "retry_at": None}))
+            for jid, part, msg, retry in bad:
                 try:
                     os.remove(part)
                 except OSError:
                     pass
-                self.events.put((jid, {"status": "failed", "error": msg, "offset": 0, "hash": None}))
+                self._fail(c, jid, msg, retry=retry, restart=True)
 
     def session_bytes(self):
         with self.flock:
@@ -305,8 +307,8 @@ class Engine:
 
     def _claim(self, c):
         with self.claim_lock:
-            row = c.execute("SELECT id,src,dst,size,mtime,offset FROM jobs "
-                            "WHERE status='pending' ORDER BY id LIMIT 1").fetchone()
+            row = c.execute("SELECT id,src,dst,size,mtime,offset FROM jobs WHERE status='pending' "
+                            "AND (retry_at IS NULL OR retry_at <= ?) ORDER BY id LIMIT 1", (time.time(),)).fetchone()
             if row:
                 c.execute("UPDATE jobs SET status='running' WHERE id=?", (row[0],))
             return row
@@ -326,20 +328,43 @@ class Engine:
                 result, digest = self._copy(c, act, mtime, offset, stop)
                 if result:
                     self.events.put((jid, {"status": result, "offset": act.size, "size": act.size, "error": None,
-                                           "speed": act.avg, "hash": digest}))
+                                           "speed": act.avg, "hash": digest, "retry_at": None,
+                                           **({"tries": 0} if result == "done" else {})}))
                 else:
                     self.events.put((jid, {"status": "pending", "offset": act.copied, "size": act.size}))
             except VerifyError as e:
-                c.execute("UPDATE jobs SET status='failed', error=?, offset=0, hash=NULL WHERE id=?", (str(e), jid))
-                self.events.put((jid, {"status": "failed", "error": str(e), "offset": 0}))
+                self._fail(c, jid, str(e), retry=True, restart=True)
+            except OSError as e:
+                # Offset bleibt auf dem zuletzt *gesicherten* Stand – nur der ist sicher auf der Platte
+                self._fail(c, jid, e.strerror or str(e), retry=e.errno in TRANSIENT)
             except Exception as e:
-                msg = getattr(e, "strerror", None) or str(e)
-                c.execute("UPDATE jobs SET status='failed', error=?, offset=? WHERE id=?", (msg, act.copied, jid))
-                self.events.put((jid, {"status": "failed", "error": msg, "offset": act.copied}))
+                self._fail(c, jid, str(e), retry=False)
             finally:
                 with self.flock:
                     self.finished_bytes += act.copied - act.base
                     self.active.pop(jid, None)
+
+    def _fail(self, c, jid, msg, retry, restart=False):
+        """Fehler verbuchen. Vorübergehende Fehler: bis zu len(RETRY_DELAYS)-mal später erneut."""
+        tries = (c.execute("SELECT tries FROM jobs WHERE id=?", (jid,)).fetchone() or [0])[0] or 0
+        reset = ", offset=0, hash=NULL" if restart else ""
+        if retry and tries < len(RETRY_DELAYS):
+            delay = RETRY_DELAYS[tries]
+            at = time.time() + delay
+            note = f"{msg} – Versuch {tries + 2}/{len(RETRY_DELAYS) + 1} folgt"
+            c.execute(f"UPDATE jobs SET status='pending', tries=?, retry_at=?, error=?{reset} WHERE id=?",
+                      (tries + 1, at, note, jid))
+            kw = {"status": "pending", "tries": tries + 1, "retry_at": at, "error": note}
+        else:
+            if tries:
+                msg += f" (nach {tries + 1} Versuchen)"
+            c.execute(f"UPDATE jobs SET status='failed', retry_at=NULL, error=?{reset} WHERE id=?", (msg, jid))
+            kw = {"status": "failed", "retry_at": None, "error": msg}
+        if restart:
+            kw["offset"] = 0
+        else:
+            kw["offset"] = (c.execute("SELECT offset FROM jobs WHERE id=?", (jid,)).fetchone() or [0])[0]
+        self.events.put((jid, kw))
 
     def _copy(self, c, act, mtime, offset, stop):
         """Rückgabe (status, sha256) mit status „done“/„written“, oder (None, None) bei Pause."""
@@ -400,6 +425,9 @@ class Engine:
             fd.flush()
             if not small:
                 os.fsync(fd.fileno())
+                # alles sicher auf der Platte: Stand sichern, damit ein späterer Fehler (Prüfen,
+                # Umbenennen …) beim nächsten Versuch nicht wieder alles kopieren muss
+                c.execute("UPDATE jobs SET offset=? WHERE id=?", (act.copied, act.id))
         took = time.monotonic() - t0                 # große Dateien: inkl. abschließendem fsync
         moved = act.copied - act.base                # bei Fortsetzung: nur der Teil dieser Sitzung
         act.avg = moved / took if moved and took > 0 else None
@@ -407,7 +435,9 @@ class Engine:
         shutil.copystat(act.src, part)               # Zeiten/Rechte gehen beim Umbenennen mit
 
         if small:
-            c.execute("UPDATE jobs SET status='written', offset=size, error=NULL, speed=?, hash=? WHERE id=?",
+            # Versuchszähler bleibt, bis die Datei gesichert und geprüft ist (flush)
+            c.execute("UPDATE jobs SET status='written', offset=size, error=NULL, speed=?, hash=?, retry_at=NULL "
+                      "WHERE id=?",
                       (act.avg, digest, act.id))
             with self.wlock:
                 self.written.append((act.id, part, act.dst, digest))
@@ -415,8 +445,7 @@ class Engine:
                     self.written_since = time.monotonic()
             return "written", digest
 
-        # große Datei: Stand sichern (Abbruch beim Prüfen → beim Fortsetzen nur noch prüfen)
-        c.execute("UPDATE jobs SET offset=? WHERE id=?", (act.copied, act.id))
+        # große Datei (Stand ist gesichert): Abbruch beim Prüfen → beim Fortsetzen nur noch prüfen
         if digest is not None:
             self.events.put((act.id, {"status": "verifying"}))
             act.verified = 0
@@ -430,6 +459,6 @@ class Engine:
                 raise VerifyError("Prüfung fehlgeschlagen: Ziel weicht von der Quelle ab")
         os.replace(part, act.dst)
         fsync_dir(os.path.dirname(act.dst))
-        c.execute("UPDATE jobs SET status='done', offset=size, error=NULL, speed=?, hash=? WHERE id=?",
-                  (act.avg, digest, act.id))
+        c.execute("UPDATE jobs SET status='done', offset=size, error=NULL, speed=?, hash=?, tries=0, retry_at=NULL "
+                  "WHERE id=?", (act.avg, digest, act.id))
         return "done", digest

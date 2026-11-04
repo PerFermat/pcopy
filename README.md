@@ -26,6 +26,13 @@ Pause, Absturz oder abgezogener Platte exakt an der richtigen Stelle weitergehen
 - **Prüfung vor dem Start:** freier Platz je Ziel-Laufwerk, Dateien ab 4 GB auf FAT32 und
   Zeichen, die FAT32/exFAT in Namen nicht erlauben (`< > : " \ | ? *`). Betroffene Dateien
   lassen sich überspringen, der Rest wird kopiert.
+- **Automatisch wiederholen:** Bei vorübergehenden Fehlern (E/A-Fehler, Gerät kurz weg,
+  Zeitüberschreitung, fehlgeschlagene Prüfung) bis zu 3 weitere Versuche nach 10, 30 und 60 s –
+  ab dem zuletzt gesicherten Stand. Dauerhafte Fehler (Datei fehlt, keine Berechtigung, Platte
+  voll) werden sofort gemeldet.
+- **Bericht** (Datei → Bericht…, Strg+B): Zusammenfassung, alle Fehler mit Grund und die
+  übersprungenen Dateien; speicherbar als Text oder CSV. Öffnet sich am Ende von selbst, wenn
+  neue Fehler aufgetreten sind.
 - **Wiederaufnehmbar:** Pause, Beenden oder Absturz – beim nächsten Start geht es an der
   gesicherten Byte-Position weiter. Das Fenster lässt sich auch schließen, wenn die Zielplatte
   hängt.
@@ -86,6 +93,7 @@ Die Job-Liste liegt als SQLite-Datenbank `pcopy.db` **neben dem Programm**. Eins
 | `pcopy/engine.py` | Kopier-Threads, Tempo-Limit, Sichern, Prüfen, Hilfsdateien |
 | `pcopy/precheck.py` | Prüfung vor dem Start (Platz, FAT32-Grenzen) |
 | `pcopy/checker.py` | Nachträgliches Prüfen fertiger Dateien |
+| `pcopy/report.py` | Bericht (Anzeige, Text, CSV) |
 | `pcopy/scanner.py` | Einlesen im Hintergrund, Regeln für vorhandene Dateien |
 | `pcopy/model.py` | Tabellenmodell und Fortschrittsbalken |
 | `pcopy/db.py` | Datenbank |

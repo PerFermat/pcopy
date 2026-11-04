@@ -12,6 +12,7 @@ from .fontsize import FontMixin
 from .listops import ListMixin
 from .menus import MenuMixin
 from . import precheck
+from .report import ReportDialog
 from .model import BarDelegate, CHECKING, DropTable, FINISHED, JobModel
 from .scanner import EXISTING, Scanner
 from .util import hsize, htime
@@ -31,6 +32,8 @@ class MainWindow(AddMixin, ListMixin, MenuMixin, FontMixin, QtWidgets.QMainWindo
         self.engine = Engine()
         self.checker = Checker(self.engine)
         self.checking = False     # läuft eine Prüfrunde (für die Abschlussmeldung)
+        self.report = None
+        self.fails_at_start = 0   # Fehler beim Start – neue Fehler öffnen am Ende den Bericht
         self.model = JobModel()
         self.samples = deque()
         self.shown_active = set()
@@ -177,8 +180,19 @@ class MainWindow(AddMixin, ListMixin, MenuMixin, FontMixin, QtWidgets.QMainWindo
         if not self.engine.is_running() and not self.check_targets():
             return
         self.engine.verify = self.verify.isChecked()
+        if not self.engine.is_running():
+            self.fails_at_start = sum(r["status"] == "failed" for r in self.model.rows)
         self.engine.start(self.spin.value())
         self.tick()
+
+    def show_report(self):
+        if self.report is None:
+            self.report = ReportDialog(self, self.db, self.target.text() or str(APP_DIR))
+        else:
+            self.report.refresh()
+        self.report.show()
+        self.report.raise_()
+        self.report.activateWindow()
 
     def check_targets(self):
         """Platz, 4-GB-Grenze (FAT32) und erlaubte Zeichen vor dem Start prüfen.
@@ -237,10 +251,13 @@ class MainWindow(AddMixin, ListMixin, MenuMixin, FontMixin, QtWidgets.QMainWindo
         rows = self.model.rows
         total = done = 0
         n_done = n_fail = n_all = 0
-        for r in rows:
+        wall = time.time()
+        for i, r in enumerate(rows):
             if r["status"] == "failed":
                 n_fail += 1
                 continue
+            if r.get("retry_at") and r["status"] == "pending" and r["retry_at"] > wall - 2:
+                self.model.refresh(i, 4)                 # Countdown „Wiederholung in … s“
             n_all += 1
             total += r["size"]
             done += self.model.copied(r)
@@ -252,7 +269,9 @@ class MainWindow(AddMixin, ListMixin, MenuMixin, FontMixin, QtWidgets.QMainWindo
                 and not self.scans and not self.engine.unsynced():
             self.engine.pause()
             self.status.showMessage(f"Fertig – {n_done} Dateien" + (f", {n_fail} mit Fehler" if n_fail else "")
-                                    + ". Neue Dateien werden erst nach „Start“ kopiert.", 15000)
+                                    + ". Neue Dateien werden erst nach „Start“ kopiert. Bericht: Strg+B", 15000)
+            if n_fail > self.fails_at_start:
+                self.show_report()                       # neue Fehler in diesem Durchlauf
 
         now = time.monotonic()
         self.samples.append((now, self.engine.session_bytes()))
