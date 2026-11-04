@@ -1,0 +1,9 @@
+# Job-Liste (persönliche Dateipfade) – liegt neben dem Programm
+pcopy.db
+pcopy.db-*
+pcopy.db.lock
+pcopy.db.tmp
+# wird von install-pcopy.sh mit den lokalen Pfaden erzeugt
+pcopy.desktop
+__pycache__/
+*.pyc

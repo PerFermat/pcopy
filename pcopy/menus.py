@@ -1,0 +1,103 @@
+"""Menüleiste und Kontextmenü der Tabelle."""
+import os
+
+from .qt import QtCore, QtGui, QtWidgets
+from .db import DB_PATH
+from .scanner import EXISTING
+
+
+class MenuMixin:
+    def _build_menu(self):
+        act, mb = self._acts, self.menuBar()
+
+        m = mb.addMenu("&Datei")
+        m.addAction(self.a_files)
+        m.addAction(self.a_folder)
+        m.addSeparator()
+        m.addAction(act("Zielordner wählen…", "folder-new", self.pick_target, None, "Ctrl+Shift+T"))
+        m.addAction(act("Zielordner öffnen", "folder-open",
+                        lambda: self.target.text() and QtGui.QDesktopServices.openUrl(
+                            QtCore.QUrl.fromLocalFile(self.target.text()))))
+        m.addSeparator()
+        m.addAction(act("Beenden", "application-exit", self.close, None, "Ctrl+Q"))
+
+        m = mb.addMenu("&Kopieren")
+        m.addAction(self.a_start)
+        m.addAction(self.a_pause)
+        m.addSeparator()
+        m.addAction(act("Fehlerhafte erneut versuchen", "view-refresh", self.retry_failed,
+                        "Alle Dateien mit Fehler wieder in die Warteschlange stellen", "Ctrl+R"))
+
+        m = mb.addMenu("&Liste")
+        m.addAction(act("Ausgewählte entfernen", "list-remove", self.remove_selected,
+                        "Markierte Einträge aus der Liste nehmen (laufende bleiben)", "Del"))
+        m.addAction(act("Fertige entfernen", "edit-clear-list", self.clear_done,
+                        "Fertige und übersprungene Einträge aus der Liste nehmen"))
+        m.addAction(act("Fehlerhafte entfernen", "dialog-error", self.clear_failed))
+        m.addSeparator()
+        m.addAction(act("Alles auswählen", "edit-select-all", self.table.selectAll, None, "Ctrl+A"))
+        m.addSeparator()
+        self.a_retarget = act("Zielordner aktualisieren", "folder-sync", self.retarget_selected,
+                              "Markierte, noch wartende Dateien auf den oben eingestellten Zielordner umstellen",
+                              "Ctrl+Shift+U")
+        m.addAction(self.a_retarget)
+        m.addSeparator()
+        m.addAction(act("Liste leeren…", "edit-clear-all", self.clear_all,
+                        "Alle Einträge entfernen (laufendes Kopieren wird angehalten)", "Ctrl+Shift+Del"))
+
+        m = mb.addMenu("&Einstellungen")
+        self.follow = m.addAction("Liste mitlaufen lassen")
+        self.follow.setCheckable(True)
+        self.follow.setStatusTip("Liste so verschieben, dass die gerade kopierten Dateien in der Mitte stehen")
+        self.follow.setChecked(self.settings.value("follow", "true") == "true")
+        self.follow.toggled.connect(lambda on: on and self.shown_active.clear())
+        m.addSeparator()
+        sub = m.addMenu("Vorhandene Dateien")
+        grp = QtGui.QActionGroup(self)
+        modes = []
+        for i, (_, text) in enumerate(EXISTING):
+            a = sub.addAction(text)
+            a.setCheckable(True)
+            grp.addAction(a)
+            a.triggered.connect(lambda _=False, i=i: self.existing.setCurrentIndex(i))
+            modes.append(a)
+        modes[self.existing.currentIndex()].setChecked(True)
+        self.existing.currentIndexChanged.connect(lambda i: modes[i].setChecked(True))
+        m.addSeparator()
+        self.build_font_menu(m)
+
+        m = mb.addMenu("&Hilfe")
+        m.addAction(act("Über pcopy", "help-about", lambda: QtWidgets.QMessageBox.about(
+            self, "Über pcopy",
+            "<b>pcopy</b> – paralleler, wiederaufnehmbarer Datei-Kopierer<br><br>"
+            "Abbruch, Pause oder Absturz: beim nächsten Start geht es an derselben Stelle weiter.<br>"
+            f"Liste: <code>{DB_PATH}</code>")))
+
+    def context_menu(self, pos):
+        ids = self.selected_ids()
+        if not ids:
+            return
+        m = QtWidgets.QMenu(self)
+        r = self.model.rows[self.model.idx[ids[0]]]
+        a_open = m.addAction(QtGui.QIcon.fromTheme("folder-open"), "Zielordner öffnen")
+        a_src = m.addAction(QtGui.QIcon.fromTheme("folder"), "Quellordner öffnen")
+        m.addSeparator()
+        t = self.target.text().strip()
+        a_tgt = m.addAction(QtGui.QIcon.fromTheme("folder-sync"),
+                            f"Zielordner aktualisieren → {t}" if t else "Zielordner aktualisieren …")
+        a_tgt.setEnabled(any(self.model.rows[self.model.idx[i]]["status"] == "pending" for i in ids))
+        a_retry = m.addAction(QtGui.QIcon.fromTheme("view-refresh"), "Erneut versuchen")
+        a_del = m.addAction(QtGui.QIcon.fromTheme("list-remove"), "Aus Liste entfernen")
+        chosen = m.exec(self.table.viewport().mapToGlobal(pos))
+        q = ",".join("?" * len(ids))
+        if chosen == a_open:
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(os.path.dirname(r["dst"])))
+        elif chosen == a_src:
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(os.path.dirname(r["src"])))
+        elif chosen == a_retry:
+            self.db.execute(f"UPDATE jobs SET status='pending', error=NULL WHERE status='failed' AND id IN ({q})", ids)
+            self.model.load(self.db)
+        elif chosen == a_del:
+            self.remove_selected()
+        elif chosen == a_tgt:
+            self.retarget_selected()
