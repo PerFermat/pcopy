@@ -6,7 +6,7 @@ from .util import hsize, htime
 
 COLS = ["Datei", "Zielordner", "Größe", "Fortschritt", "Status", "Tempo", "Rest"]
 STATUS_TXT = {"pending": "wartend", "running": "kopiert …", "done": "fertig", "failed": "Fehler",
-              "skipped": "übersprungen", "written": "sichern …"}
+              "skipped": "übersprungen", "written": "sichern …", "verifying": "prüft …"}
 FINISHED = ("done", "skipped")
 COPIED = FINISHED + ("written",)       # Daten vollständig im Ziel (written: noch nicht gesynct)
 
@@ -31,8 +31,8 @@ class JobModel(QtCore.QAbstractTableModel):
     def load(self, c):
         self.beginResetModel()
         self.rows = [dict(id=r[0], src=r[1], dst=r[2], size=r[3] or 0, offset=r[4] or 0, status=r[5], error=r[6],
-                          speed=r[7])
-                     for r in c.execute("SELECT id,src,dst,size,offset,status,error,speed FROM jobs ORDER BY id")]
+                          speed=r[7], hash=r[8])
+                     for r in c.execute("SELECT id,src,dst,size,offset,status,error,speed,hash FROM jobs ORDER BY id")]
         self.idx = {r["id"]: i for i, r in enumerate(self.rows)}
         self.live.clear()
         self.endResetModel()
@@ -64,15 +64,15 @@ class JobModel(QtCore.QAbstractTableModel):
         if i is None:
             return
         self.rows[i].update(kw)
-        if kw.get("status") != "running":
+        if kw.get("status") not in ("running", "verifying"):
             self.live.pop(jid, None)
         self.dataChanged.emit(self.index(i, 0), self.index(i, len(COLS) - 1))
 
-    def set_live(self, jid, copied, speed):
+    def set_live(self, jid, copied, speed, verified=None):
         i = self.idx.get(jid)
         if i is None:
             return
-        self.live[jid] = (copied, speed)
+        self.live[jid] = (copied, speed, verified)
         self.dataChanged.emit(self.index(i, 2), self.index(i, len(COLS) - 1))
 
     def copied(self, r):
@@ -89,15 +89,20 @@ class JobModel(QtCore.QAbstractTableModel):
         st = r["status"]
         done = self.copied(r)
         frac = done / r["size"] if r["size"] else (1.0 if st in FINISHED else 0.0)
-        speed = self.live.get(r["id"], (0, 0))[1]
+        _, speed, verified = self.live.get(r["id"], (0, 0, None))
+        if st == "verifying" and verified is not None and r["size"]:
+            frac = verified / r["size"]              # Balken zeigt den Fortschritt des Prüfens
         if role == Qt.ItemDataRole.DisplayRole:
             if col == 0: return os.path.basename(r["src"])
             if col == 1: return os.path.dirname(r["dst"])
             if col == 2: return hsize(r["size"])
-            if col == 3: return f"{frac * 100:.1f} %".replace(".", ",")
+            if col == 3:
+                return ("prüft " if st == "verifying" else "") + f"{frac * 100:.1f} %".replace(".", ",")
             if col == 4:
                 if st == "pending" and r["offset"]:
                     return "pausiert"
+                if st == "done" and r.get("hash"):
+                    return "geprüft"
                 return STATUS_TXT.get(st, st)
             if col == 5:
                 if st in ("done", "written") and r.get("speed"):
@@ -108,16 +113,18 @@ class JobModel(QtCore.QAbstractTableModel):
             return frac
         elif role == Qt.ItemDataRole.ToolTipRole:
             t = f"Quelle: {r['src']}\nZiel:   {r['dst']}"
+            if r.get("hash") and st == "done":
+                t += f"\nSHA-256: {r['hash']}\n(nach dem Kopieren von der Platte gelesen und verglichen)"
             return t + (f"\nFehler: {r['error']}" if r.get("error") else "")
         elif role == Qt.ItemDataRole.ForegroundRole and col == 4:
             return QtGui.QBrush(QtGui.QColor({"done": "#2e9e44", "failed": "#d0342c", "running": "#2a7ad5", "skipped": "#2e9e44",
-                                              "written": "#2a7ad5"}
+                                              "written": "#2a7ad5", "verifying": "#2a7ad5"}
                                              .get(st, "#888888")))
         elif role == Qt.ItemDataRole.TextAlignmentRole and col in (2, 5, 6):
             return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         elif role == Qt.ItemDataRole.DecorationRole and col == 0:
             return QtGui.QIcon.fromTheme({"done": "dialog-ok-apply", "failed": "dialog-error", "skipped": "go-jump", "written": "document-save",
-                                          "running": "go-next"}.get(st, "text-x-generic"))
+                                          "running": "go-next", "verifying": "document-preview"}.get(st, "text-x-generic"))
         return None
 
 

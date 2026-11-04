@@ -13,6 +13,15 @@ Pause, Absturz oder abgezogener Platte exakt an der richtigen Stelle weitergehen
   nach und nach.
 - **Mehrere Kopien gleichzeitig**, Fortschritt pro Datei und gesamt, Tempo und Restzeit;
   fertige Dateien zeigen ihr Durchschnittstempo (Ø).
+- **Geprüft:** Jede Datei wird nach dem Sichern von der Platte zurückgelesen (am Seiten-Cache
+  vorbei) und per SHA-256 mit der Quelle verglichen. Die Prüfsumme der Quelle entsteht beim
+  Kopieren, die Quelle wird dafür nicht zusätzlich gelesen. Abschaltbar unter Einstellungen.
+- **Nie halbe Dateien unter echtem Namen:** Kopiert wird in eine versteckte Hilfsdatei
+  `.NAME.pcopy-part`; erst wenn sie vollständig, gesichert und geprüft ist, wird sie in einem
+  Schritt umbenannt. Eine Zieldatei, die ersetzt wird, bleibt bis dahin unverändert.
+- **Prüfung vor dem Start:** freier Platz je Ziel-Laufwerk, Dateien ab 4 GB auf FAT32 und
+  Zeichen, die FAT32/exFAT in Namen nicht erlauben (`< > : " \ | ? *`). Betroffene Dateien
+  lassen sich überspringen, der Rest wird kopiert.
 - **Wiederaufnehmbar:** Pause, Beenden oder Absturz – beim nächsten Start geht es an der
   gesicherten Byte-Position weiter. Das Fenster lässt sich auch schließen, wenn die Zielplatte
   hängt.
@@ -70,7 +79,8 @@ Die Job-Liste liegt als SQLite-Datenbank `pcopy.db` **neben dem Programm**. Eins
 | `pcopy/menus.py` | Menüleiste und Kontextmenü |
 | `pcopy/adding.py` | Dateien hinzufügen, Drag & Drop |
 | `pcopy/listops.py` | Entfernen, Leeren, erneut versuchen, Ziel umstellen |
-| `pcopy/engine.py` | Kopier-Threads, Tempo-Limit, Sichern |
+| `pcopy/engine.py` | Kopier-Threads, Tempo-Limit, Sichern, Prüfen, Hilfsdateien |
+| `pcopy/precheck.py` | Prüfung vor dem Start (Platz, FAT32-Grenzen) |
 | `pcopy/scanner.py` | Einlesen im Hintergrund, Regeln für vorhandene Dateien |
 | `pcopy/model.py` | Tabellenmodell und Fortschrittsbalken |
 | `pcopy/db.py` | Datenbank |

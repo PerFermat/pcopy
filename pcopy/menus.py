@@ -46,6 +46,12 @@ class MenuMixin:
                         "Alle Einträge entfernen (laufendes Kopieren wird angehalten)", "Ctrl+Shift+Del"))
 
         m = mb.addMenu("&Einstellungen")
+        self.verify = m.addAction("Nach dem Kopieren prüfen (SHA-256)")
+        self.verify.setCheckable(True)
+        self.verify.setStatusTip("Jede Datei nach dem Sichern von der Platte zurücklesen und mit der Quelle "
+                                 "vergleichen – erst dann bekommt sie ihren richtigen Namen")
+        self.verify.setChecked(self.settings.value("verify", "true") == "true")
+        self.verify.toggled.connect(lambda on: setattr(self.engine, "verify", on))
         self.follow = m.addAction("Liste mitlaufen lassen")
         self.follow.setCheckable(True)
         self.follow.setStatusTip("Liste so verschieben, dass die gerade kopierten Dateien in der Mitte stehen")

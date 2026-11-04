@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 from .db import db_connect
+from .engine import is_part
 
 EXISTING = [("skip", "überspringen"), ("overwrite", "überschreiben"), ("newer", "überschreiben, wenn neuer")]
 
@@ -29,6 +30,8 @@ def collect(paths, dest):
             for root, dirs, files in os.walk(sp):
                 dirs.sort()
                 for f in sorted(files):
+                    if is_part(f):                   # angefangene Hilfsdatei einer früheren Kopie
+                        continue
                     fp = Path(root) / f
                     if fp.is_file():
                         yield fp, dest / sp.name / fp.relative_to(sp)

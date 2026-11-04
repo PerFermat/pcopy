@@ -3,6 +3,7 @@ import os
 
 from .qt import Qt, QtWidgets
 from .db import guess_root
+from .engine import part_path
 from .model import COPIED
 from .scanner import keep_existing
 
@@ -41,10 +42,10 @@ class ListMixin:
                                + "Fertig kopierte Dateien im Ziel bleiben erhalten.")
         cb = None
         if partial or busy:
-            cb = QtWidgets.QCheckBox("Angefangene, unvollständige Dateien im Ziel löschen")
+            cb = QtWidgets.QCheckBox("Angefangene Hilfsdateien (.pcopy-part) im Ziel löschen")
             cb.setChecked(True)
-            cb.setToolTip("Sonst bleiben halbe Dateien im Ziel liegen und würden beim nächsten Mal\n"
-                          "mit „überspringen“ fälschlich als vorhanden gelten.")
+            cb.setToolTip("Unfertige Kopien liegen als versteckte .pcopy-part-Dateien im Ziel.\n"
+                          "Fertige Dateien und vorhandene Zieldateien werden nie gelöscht.")
             box.setCheckBox(cb)
         box.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No)
         box.setDefaultButton(QtWidgets.QMessageBox.StandardButton.No)
@@ -59,12 +60,12 @@ class ListMixin:
             self.tick()
             removed = 0
             if cb is not None and cb.isChecked():
-                # Nur Dateien, die pcopy selbst angefangen hat: Offset > 0 oder gerade in Arbeit
+                # nur pcopys eigene Hilfsdateien – die echten Zieldateien bleiben unberührt
                 q = ",".join("?" * len(held))
-                for (dst,) in self.db.execute("SELECT dst FROM jobs WHERE status NOT IN ('done','skipped','written') "
-                                              f"AND (offset>0 OR id IN ({q}))", held).fetchall():
+                for jid, dst in self.db.execute("SELECT id,dst FROM jobs WHERE status NOT IN ('done','skipped') "
+                                                f"AND (offset>0 OR status='written' OR id IN ({q}))", held).fetchall():
                     try:
-                        os.remove(dst)
+                        os.remove(part_path(dst, jid))
                         removed += 1
                     except OSError:
                         pass
@@ -74,7 +75,7 @@ class ListMixin:
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
         self.status.showMessage(f"Liste geleert ({n} Einträge)"
-                                + (f", {removed} unvollständige Dateien im Ziel gelöscht" if removed else ""), 10000)
+                                + (f", {removed} angefangene Hilfsdateien im Ziel gelöscht" if removed else ""), 10000)
 
     def selected_ids(self):
         return [self.model.rows[i.row()]["id"] for i in self.table.selectionModel().selectedRows()]
@@ -118,7 +119,7 @@ class ListMixin:
                     moved += 1
                     skipped += status == "skipped"
                     if off > 0:
-                        stale.append(dst)            # angefangene Datei am alten Ziel
+                        stale.append(part_path(dst, jid))    # angefangene Hilfsdatei am alten Ziel
                 self.db.execute("COMMIT")
             except Exception:
                 self.db.execute("ROLLBACK")
@@ -140,5 +141,5 @@ class ListMixin:
         if other:
             msg += f", {other} nicht umgestellt (schon kopiert, in Arbeit oder Fehler)"
         if stale:
-            msg += f"; {len(stale)} angefangene Dateien am alten Ziel gelöscht"
+            msg += f"; {len(stale)} angefangene Hilfsdateien am alten Ziel gelöscht"
         self.status.showMessage(msg, 15000)

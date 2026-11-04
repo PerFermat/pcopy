@@ -1,11 +1,18 @@
 """Kopier-Engine: Worker-Threads, Tempo-Begrenzung, wiederaufnehmbares Kopieren.
 
-Große Dateien werden einzeln mit fsync gesichert (und alle SYNC_EVERY s ihr Stand). Kleine
-Dateien (< SMALL) bekommen erst den Status „written“; ein Sync-Thread sichert sie gesammelt per
-syncfs und setzt sie dann gemeinsam auf „done“. Was beim Programmstart noch „written“ ist, war
-nicht sicher auf der Platte und wird neu kopiert."""
+Ablauf pro Datei:
+  1. Kopieren in eine Hilfsdatei `.NAME.pcopy-part` im Zielordner (wiederaufnehmbar).
+  2. Sichern: große Dateien einzeln per fsync (und alle SYNC_EVERY s ihr Stand); kleine Dateien
+     (< SMALL) bekommen den Status „written“ und werden vom Sync-Thread gesammelt per syncfs
+     gesichert.
+  3. Prüfen (falls eingeschaltet): Hilfsdatei aus dem Seiten-Cache werfen, von der Platte
+     zurücklesen und die SHA-256 mit der beim Kopieren berechneten Prüfsumme der Quelle vergleichen.
+  4. Erst dann per os.replace auf den echten Namen umbenennen → unter dem echten Namen liegt
+     nie eine halbe oder fehlerhafte Datei, eine ersetzte Datei bleibt bis zuletzt erhalten.
+Was beim Programmstart noch „written“ ist, war nicht sicher auf der Platte und wird neu kopiert."""
 import ctypes
 import ctypes.util
+import hashlib
 import os
 import queue
 import shutil
@@ -19,6 +26,7 @@ CHUNK = 1024 * 1024
 SYNC_EVERY = 2.0          # s: Stand großer Dateien sichern / kleine Dateien gesammelt syncen
 SMALL = 8 * 1024 * 1024   # kleiner als das: kein fsync pro Datei, sondern gesammelt
 SYNC_FILES = 200          # spätestens nach so vielen kleinen Dateien syncen
+PART_SUFFIX = ".pcopy-part"
 
 try:
     _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
@@ -41,10 +49,39 @@ def syncfs(path):
         os.close(fd)
 
 
+def fsync_dir(path):
+    """Verzeichniseintrag (z. B. nach dem Umbenennen) sichern."""
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass                      # manche Dateisysteme (z. B. FUSE) können das nicht – dann eben nicht
+    finally:
+        os.close(fd)
+
+
+def part_path(dst, jid):
+    """Hilfsdatei, in die kopiert wird, bis die Datei fertig (und geprüft) ist."""
+    d, name = os.path.split(dst)
+    part = f".{name}{PART_SUFFIX}"
+    if len(part.encode()) > 250:              # Namen dürfen meist höchstens 255 Bytes lang sein
+        part = f".pcopy-{jid}{PART_SUFFIX}"
+    return os.path.join(d, part)
+
+
+def is_part(name):
+    return name.startswith(".") and name.endswith(PART_SUFFIX)
+
+
+class VerifyError(Exception):
+    pass
+
+
 class Active:
     def __init__(self, jid, src, dst, size):
         self.id, self.src, self.dst, self.size = jid, src, dst, size
         self.copied = self.base = 0
+        self.verified = None      # Bytes beim Prüfen (None = es wird gerade nicht geprüft)
         self.avg = None           # Ø-Tempo nach Abschluss (Bytes/s)
         self.started = time.monotonic()
         self.samples = deque(maxlen=60)
@@ -108,8 +145,9 @@ class Engine:
         self.finished_bytes = 0
         self.events = queue.Queue()
         self.throttle = Throttle()
+        self.verify = True        # nach dem Kopieren von der Platte zurücklesen und vergleichen
         self.n = 4
-        self.written = []         # (job-id, ziel) kleiner Dateien, die noch gesynct werden müssen
+        self.written = []         # kleine Dateien, die noch gesynct/geprüft/umbenannt werden müssen
         self.written_since = None
         self.wlock = threading.Lock()
         self.sync_lock = threading.Lock()
@@ -164,6 +202,33 @@ class Engine:
         f.join(max(2.0, end - time.monotonic()))
         return not any(t.is_alive() for t in threads) and not f.is_alive()
 
+    # ---------------------------------------------------------------- Prüfen
+    def _verify(self, path, digest, stop=None, act=None):
+        """Datei von der Platte (nicht aus dem Cache) lesen und mit `digest` vergleichen.
+        Rückgabe True/False; None, wenn per `stop` abgebrochen."""
+        h = hashlib.sha256()
+        never = threading.Event()
+        with open(path, "rb") as f:
+            try:
+                os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)   # Seiten sind gesynct
+            except (AttributeError, OSError):
+                pass
+            done = 0
+            while True:
+                if stop is not None and stop.is_set():
+                    return None
+                size = self.throttle.chunk()
+                self.throttle.wait(size, stop or never)
+                buf = f.read(size)
+                self.throttle.refund(size - len(buf))
+                if not buf:
+                    break
+                h.update(buf)
+                done += len(buf)
+                if act is not None:
+                    act.verified = done
+        return h.hexdigest() == digest
+
     # ---------------------------------------------------------------- gesammeltes Sichern
     def unsynced(self):
         with self.wlock:
@@ -178,37 +243,61 @@ class Engine:
             if n and (n >= SYNC_FILES or time.monotonic() - since >= SYNC_EVERY or not self.active):
                 self.flush(c)
 
+    def _sync_dirs(self, paths):
+        fs = {}
+        for p in paths:
+            d = os.path.dirname(p)
+            try:
+                fs.setdefault(os.stat(d).st_dev, d)
+            except OSError:
+                pass
+        for d in fs.values():
+            syncfs(d)
+
     def flush(self, c=None):
-        """Alle „written“-Dateien per syncfs sichern und gemeinsam auf „done“ setzen."""
+        """Kleine Dateien gesammelt sichern, prüfen, umbenennen und auf „done“ setzen."""
         with self.sync_lock:
             with self.wlock:
                 batch, self.written, self.written_since = self.written, [], None
             if not batch:
                 return
             c = c or db_connect()
-            ids = [(jid,) for jid, _ in batch]
+            ok, bad = [], []                     # bad: (jid, part, fehlertext)
             try:
-                fs = {}
-                for _, dst in batch:
-                    d = os.path.dirname(dst)
+                self._sync_dirs(p for _, p, _, _ in batch)           # Daten sicher auf der Platte
+                for jid, part, dst, digest in batch:
                     try:
-                        fs.setdefault(os.stat(d).st_dev, d)
-                    except OSError:
-                        pass
-                for d in fs.values():
-                    syncfs(d)
+                        if digest is not None and not self._verify(part, digest):
+                            bad.append((jid, part, "Prüfung fehlgeschlagen: Ziel weicht von der Quelle ab"))
+                            continue
+                        os.replace(part, dst)
+                        ok.append(jid)
+                    except OSError as e:
+                        bad.append((jid, part, e.strerror or str(e)))
+                if ok:
+                    done = set(ok)
+                    self._sync_dirs(dst for jid, _, dst, _ in batch if jid in done)       # Umbenennungen
             except OSError as e:
                 # nicht sicher geschrieben -> neu kopieren
+                ids = [(jid,) for jid, _, _, _ in batch]
                 c.executemany("UPDATE jobs SET status='pending', offset=0 WHERE id=? AND status='written'", ids)
                 for (jid,) in ids:
                     self.events.put((jid, {"status": "pending", "offset": 0,
                                            "error": f"Sichern fehlgeschlagen: {e.strerror or e}"}))
                 return
             c.execute("BEGIN")
-            c.executemany("UPDATE jobs SET status='done' WHERE id=? AND status='written'", ids)
+            c.executemany("UPDATE jobs SET status='done' WHERE id=? AND status='written'", [(j,) for j in ok])
+            c.executemany("UPDATE jobs SET status='failed', offset=0, hash=NULL, error=? WHERE id=?",
+                          [(msg, jid) for jid, _, msg in bad])
             c.execute("COMMIT")
-            for (jid,) in ids:
+            for jid in ok:
                 self.events.put((jid, {"status": "done"}))
+            for jid, part, msg in bad:
+                try:
+                    os.remove(part)
+                except OSError:
+                    pass
+                self.events.put((jid, {"status": "failed", "error": msg, "offset": 0, "hash": None}))
 
     def session_bytes(self):
         with self.flock:
@@ -234,12 +323,15 @@ class Engine:
             self.active[jid] = act
             self.events.put((jid, {"status": "running"}))
             try:
-                result = self._copy(c, act, mtime, offset, stop)
+                result, digest = self._copy(c, act, mtime, offset, stop)
                 if result:
                     self.events.put((jid, {"status": result, "offset": act.size, "size": act.size, "error": None,
-                                           "speed": act.avg}))
+                                           "speed": act.avg, "hash": digest}))
                 else:
                     self.events.put((jid, {"status": "pending", "offset": act.copied, "size": act.size}))
+            except VerifyError as e:
+                c.execute("UPDATE jobs SET status='failed', error=?, offset=0, hash=NULL WHERE id=?", (str(e), jid))
+                self.events.put((jid, {"status": "failed", "error": str(e), "offset": 0}))
             except Exception as e:
                 msg = getattr(e, "strerror", None) or str(e)
                 c.execute("UPDATE jobs SET status='failed', error=?, offset=? WHERE id=?", (msg, act.copied, jid))
@@ -250,26 +342,39 @@ class Engine:
                     self.active.pop(jid, None)
 
     def _copy(self, c, act, mtime, offset, stop):
+        """Rückgabe (status, sha256) mit status „done“/„written“, oder (None, None) bei Pause."""
         st = os.stat(act.src)
         if st.st_size != act.size or abs(st.st_mtime - mtime) > 1e-3:
             offset, act.size = 0, st.st_size        # Quelle geändert -> neu
             c.execute("UPDATE jobs SET size=?, mtime=?, offset=0 WHERE id=?", (st.st_size, st.st_mtime, act.id))
         small = act.size < SMALL
         os.makedirs(os.path.dirname(act.dst), exist_ok=True)
-        if offset > 0 and (not os.path.exists(act.dst) or os.path.getsize(act.dst) < offset):
+        part = part_path(act.dst, act.id)
+        if offset > 0 and (not os.path.exists(part) or os.path.getsize(part) < offset):
             offset = 0
         act.copied = act.base = offset
-        with open(act.src, "rb") as fs, open(act.dst, "r+b" if offset else "wb") as fd:
+        h = hashlib.sha256() if self.verify else None
+
+        def pause(fd):
+            fd.flush(); os.fsync(fd.fileno())
+            c.execute("UPDATE jobs SET status='pending', offset=? WHERE id=?", (act.copied, act.id))
+            return None, None
+
+        with open(act.src, "rb") as fs, open(part, "r+b" if offset else "wb") as fd:
             fd.truncate(offset)
+            if h is not None and offset:
+                # Fortsetzung: Prüfsumme braucht auch den schon kopierten Anfang der Quelle
+                while fs.tell() < offset:
+                    if stop.is_set():
+                        return pause(fd)
+                    h.update(fs.read(min(CHUNK, offset - fs.tell())))
             fs.seek(offset)
             fd.seek(offset)
             t0 = last = time.monotonic()
             act.samples.append((last, offset))   # Startpunkt: Tempo schon nach dem ersten Block
             while True:
                 if stop.is_set():
-                    fd.flush(); os.fsync(fd.fileno())
-                    c.execute("UPDATE jobs SET status='pending', offset=? WHERE id=?", (act.copied, act.id))
-                    return None
+                    return pause(fd)
                 # nur so viel beim Tempo-Limit anmelden, wie von der Datei noch übrig ist –
                 # sonst blockiert eine 5-KB-Datei die anderen Worker für einen ganzen Block
                 size = min(self.throttle.chunk(), act.size - act.copied)
@@ -283,6 +388,8 @@ class Engine:
                 if not buf:
                     break                            # Quelle während des Kopierens geschrumpft
                 fd.write(buf)
+                if h is not None:
+                    h.update(buf)
                 act.copied += len(buf)
                 now = time.monotonic()
                 act.samples.append((now, act.copied))
@@ -293,15 +400,36 @@ class Engine:
             fd.flush()
             if not small:
                 os.fsync(fd.fileno())
-        shutil.copystat(act.src, act.dst)
         took = time.monotonic() - t0                 # große Dateien: inkl. abschließendem fsync
         moved = act.copied - act.base                # bei Fortsetzung: nur der Teil dieser Sitzung
         act.avg = moved / took if moved and took > 0 else None
-        status = "written" if small else "done"
-        c.execute("UPDATE jobs SET status=?, offset=size, error=NULL, speed=? WHERE id=?", (status, act.avg, act.id))
+        digest = h.hexdigest() if h is not None else None
+        shutil.copystat(act.src, part)               # Zeiten/Rechte gehen beim Umbenennen mit
+
         if small:
+            c.execute("UPDATE jobs SET status='written', offset=size, error=NULL, speed=?, hash=? WHERE id=?",
+                      (act.avg, digest, act.id))
             with self.wlock:
-                self.written.append((act.id, act.dst))
+                self.written.append((act.id, part, act.dst, digest))
                 if self.written_since is None:
                     self.written_since = time.monotonic()
-        return status
+            return "written", digest
+
+        # große Datei: Stand sichern (Abbruch beim Prüfen → beim Fortsetzen nur noch prüfen)
+        c.execute("UPDATE jobs SET offset=? WHERE id=?", (act.copied, act.id))
+        if digest is not None:
+            self.events.put((act.id, {"status": "verifying"}))
+            act.verified = 0
+            ok = self._verify(part, digest, stop, act)
+            act.verified = None
+            if ok is None:
+                c.execute("UPDATE jobs SET status='pending' WHERE id=?", (act.id,))
+                return None, None
+            if not ok:
+                os.remove(part)
+                raise VerifyError("Prüfung fehlgeschlagen: Ziel weicht von der Quelle ab")
+        os.replace(part, act.dst)
+        fsync_dir(os.path.dirname(act.dst))
+        c.execute("UPDATE jobs SET status='done', offset=size, error=NULL, speed=?, hash=? WHERE id=?",
+                  (act.avg, digest, act.id))
+        return "done", digest

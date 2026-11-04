@@ -25,6 +25,8 @@ def db_connect(path=DB_PATH):
         c.execute("ALTER TABLE jobs ADD COLUMN root TEXT")      # Zielordner beim Hinzufügen
     if "speed" not in cols:
         c.execute("ALTER TABLE jobs ADD COLUMN speed REAL")     # Ø-Tempo (Bytes/s) einer fertigen Datei
+    if "hash" not in cols:
+        c.execute("ALTER TABLE jobs ADD COLUMN hash TEXT")      # SHA-256, wenn nach dem Kopieren geprüft
     return c
 
 

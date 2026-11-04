@@ -10,6 +10,7 @@ from .engine import Engine
 from .fontsize import FontMixin
 from .listops import ListMixin
 from .menus import MenuMixin
+from . import precheck
 from .model import BarDelegate, DropTable, FINISHED, JobModel
 from .scanner import EXISTING, Scanner
 from .util import hsize, htime
@@ -167,8 +168,38 @@ class MainWindow(AddMixin, ListMixin, MenuMixin, FontMixin, QtWidgets.QMainWindo
 
     # ---------------------------------------------------------------- Steuerung
     def start(self):
+        if not self.engine.is_running() and not self.check_targets():
+            return
+        self.engine.verify = self.verify.isChecked()
         self.engine.start(self.spin.value())
         self.tick()
+
+    def check_targets(self):
+        """Platz, 4-GB-Grenze (FAT32) und erlaubte Zeichen vor dem Start prüfen.
+        False = abgebrochen. Nicht anlegbare Dateien werden auf Wunsch als Fehler markiert."""
+        try:
+            msgs, affected = precheck.check(self.db)
+        except Exception as e:                   # Prüfung darf das Kopieren nie verhindern
+            self.status.showMessage(f"Prüfung vor dem Start nicht möglich: {e}", 8000)
+            return True
+        if not msgs:
+            return True
+        box = QtWidgets.QMessageBox(QtWidgets.QMessageBox.Icon.Warning, "Vor dem Start",
+                                    "<br><br>".join(msgs), parent=self)
+        box.setTextFormat(Qt.TextFormat.RichText)
+        go = box.addButton("Betroffene überspringen und starten" if affected else "Trotzdem starten",
+                           QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Abbrechen", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is not go:
+            return False
+        if affected:
+            self.db.execute("BEGIN")
+            self.db.executemany("UPDATE jobs SET status='failed', error=? WHERE id=? AND status='pending'",
+                                [(why, jid) for jid, why in affected.items()])
+            self.db.execute("COMMIT")
+            self.model.load(self.db)
+        return True
 
     def pause(self):
         self.engine.pause()
@@ -185,7 +216,7 @@ class MainWindow(AddMixin, ListMixin, MenuMixin, FontMixin, QtWidgets.QMainWindo
             self.model.update(jid, **kw)
         actives = list(self.engine.active.values())
         for a in actives:
-            self.model.set_live(a.id, a.copied, a.speed())
+            self.model.set_live(a.id, a.copied, a.speed(), a.verified)
         self.regroup_long(actives)
         self.follow_active({a.id for a in actives})
 
@@ -297,5 +328,6 @@ class MainWindow(AddMixin, ListMixin, MenuMixin, FontMixin, QtWidgets.QMainWindo
         self.settings.setValue("limit", self.limit.value())
         self.settings.setValue("existing", self.existing.currentData())
         self.settings.setValue("follow", "true" if self.follow.isChecked() else "false")
+        self.settings.setValue("verify", "true" if self.verify.isChecked() else "false")
         self.settings.setValue("target", self.target.text())
         e.accept()
