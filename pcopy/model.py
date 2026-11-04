@@ -6,9 +6,11 @@ from .util import hsize, htime
 
 COLS = ["Datei", "Zielordner", "Größe", "Fortschritt", "Status", "Tempo", "Rest"]
 STATUS_TXT = {"pending": "wartend", "running": "kopiert …", "done": "fertig", "failed": "Fehler",
-              "skipped": "übersprungen", "written": "sichern …", "verifying": "prüft …"}
+              "skipped": "übersprungen", "written": "sichern …", "verifying": "prüft …",
+              "checking": "prüft …", "check_wait": "Prüfung wartet"}
 FINISHED = ("done", "skipped")
-COPIED = FINISHED + ("written",)       # Daten vollständig im Ziel (written: noch nicht gesynct)
+CHECKING = ("check_wait", "checking")  # nachträgliche Prüfung fertiger Dateien (Rechtsklick → Prüfen)
+COPIED = FINISHED + ("written",) + CHECKING   # Daten vollständig im Ziel (written: noch nicht gesynct)
 
 
 class JobModel(QtCore.QAbstractTableModel):
@@ -64,7 +66,7 @@ class JobModel(QtCore.QAbstractTableModel):
         if i is None:
             return
         self.rows[i].update(kw)
-        if kw.get("status") not in ("running", "verifying"):
+        if kw.get("status") not in ("running", "verifying", "checking"):
             self.live.pop(jid, None)
         self.dataChanged.emit(self.index(i, 0), self.index(i, len(COLS) - 1))
 
@@ -90,19 +92,21 @@ class JobModel(QtCore.QAbstractTableModel):
         done = self.copied(r)
         frac = done / r["size"] if r["size"] else (1.0 if st in FINISHED else 0.0)
         _, speed, verified = self.live.get(r["id"], (0, 0, None))
-        if st == "verifying" and verified is not None and r["size"]:
+        if st in ("verifying", "checking") and verified is not None and r["size"]:
             frac = verified / r["size"]              # Balken zeigt den Fortschritt des Prüfens
         if role == Qt.ItemDataRole.DisplayRole:
             if col == 0: return os.path.basename(r["src"])
             if col == 1: return os.path.dirname(r["dst"])
             if col == 2: return hsize(r["size"])
             if col == 3:
-                return ("prüft " if st == "verifying" else "") + f"{frac * 100:.1f} %".replace(".", ",")
+                return ("prüft " if st in ("verifying", "checking") else "") + f"{frac * 100:.1f} %".replace(".", ",")
             if col == 4:
                 if st == "pending" and r["offset"]:
                     return "pausiert"
                 if st == "done" and r.get("hash"):
                     return "geprüft"
+                if st == "skipped" and r.get("hash"):
+                    return "übersprungen, geprüft"
                 return STATUS_TXT.get(st, st)
             if col == 5:
                 if st in ("done", "written") and r.get("speed"):
@@ -113,18 +117,20 @@ class JobModel(QtCore.QAbstractTableModel):
             return frac
         elif role == Qt.ItemDataRole.ToolTipRole:
             t = f"Quelle: {r['src']}\nZiel:   {r['dst']}"
-            if r.get("hash") and st == "done":
+            if r.get("hash") and st in FINISHED:
                 t += f"\nSHA-256: {r['hash']}\n(nach dem Kopieren von der Platte gelesen und verglichen)"
             return t + (f"\nFehler: {r['error']}" if r.get("error") else "")
         elif role == Qt.ItemDataRole.ForegroundRole and col == 4:
             return QtGui.QBrush(QtGui.QColor({"done": "#2e9e44", "failed": "#d0342c", "running": "#2a7ad5", "skipped": "#2e9e44",
-                                              "written": "#2a7ad5", "verifying": "#2a7ad5"}
+                                              "written": "#2a7ad5", "verifying": "#2a7ad5",
+                                              "checking": "#2a7ad5", "check_wait": "#2a7ad5"}
                                              .get(st, "#888888")))
         elif role == Qt.ItemDataRole.TextAlignmentRole and col in (2, 5, 6):
             return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         elif role == Qt.ItemDataRole.DecorationRole and col == 0:
             return QtGui.QIcon.fromTheme({"done": "dialog-ok-apply", "failed": "dialog-error", "skipped": "go-jump", "written": "document-save",
-                                          "running": "go-next", "verifying": "document-preview"}.get(st, "text-x-generic"))
+                                          "running": "go-next", "verifying": "document-preview",
+                                          "checking": "document-preview", "check_wait": "document-preview"}.get(st, "text-x-generic"))
         return None
 
 

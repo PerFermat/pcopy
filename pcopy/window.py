@@ -5,13 +5,14 @@ from collections import deque
 
 from .qt import Qt, QtCore, QtGui, QtWidgets
 from .adding import AddMixin
+from .checker import Checker
 from .db import APP_DIR, db_connect
 from .engine import Engine
 from .fontsize import FontMixin
 from .listops import ListMixin
 from .menus import MenuMixin
 from . import precheck
-from .model import BarDelegate, DropTable, FINISHED, JobModel
+from .model import BarDelegate, CHECKING, DropTable, FINISHED, JobModel
 from .scanner import EXISTING, Scanner
 from .util import hsize, htime
 
@@ -28,6 +29,8 @@ class MainWindow(AddMixin, ListMixin, MenuMixin, FontMixin, QtWidgets.QMainWindo
         self.settings = QtCore.QSettings(APP, "gui")
         self.db = db_connect()
         self.engine = Engine()
+        self.checker = Checker(self.engine)
+        self.checking = False     # läuft eine Prüfrunde (für die Abschlussmeldung)
         self.model = JobModel()
         self.samples = deque()
         self.shown_active = set()
@@ -220,6 +223,14 @@ class MainWindow(AddMixin, ListMixin, MenuMixin, FontMixin, QtWidgets.QMainWindo
         actives = list(self.engine.active.values())
         for a in actives:
             self.model.set_live(a.id, a.copied, a.speed(), a.verified)
+        cur = self.checker.current
+        if cur is not None:
+            self.model.set_live(cur.id, cur.size, 0, cur.verified)
+        elif self.checking and not self.checker.busy():
+            self.checking = False
+            ok, bad = self.checker.ok, self.checker.bad
+            self.status.showMessage(f"Prüfung fertig: {ok} Dateien in Ordnung"
+                                    + (f", {bad} mit Fehler (siehe Status/Tooltip)" if bad else ""), 20000)
         self.regroup_long(actives)
         self.follow_active({a.id for a in actives})
 
@@ -233,7 +244,7 @@ class MainWindow(AddMixin, ListMixin, MenuMixin, FontMixin, QtWidgets.QMainWindo
             n_all += 1
             total += r["size"]
             done += self.model.copied(r)
-            n_done += r["status"] in FINISHED
+            n_done += r["status"] in FINISHED or r["status"] in CHECKING
         open_jobs = n_all - n_done                       # wartend, läuft oder noch nicht gesichert
 
         # Alles erledigt: anhalten. Später hinzugefügte Dateien warten dann auf „Start“.
@@ -329,6 +340,7 @@ class MainWindow(AddMixin, ListMixin, MenuMixin, FontMixin, QtWidgets.QMainWindo
         QtWidgets.QApplication.processEvents()
         # Hängt ein Worker (Ziel antwortet nicht), trotzdem beenden: der Stand bis zur letzten
         # Sicherung (≤ SYNC_EVERY s) steht in der DB, der Rest wird beim nächsten Start kopiert.
+        self.checker.stop()
         scan_ok = self.scanner.abort(timeout=2.0)
         self.clean_exit = self.engine.shutdown(timeout=5.0) and scan_ok
         QtWidgets.QApplication.restoreOverrideCursor()

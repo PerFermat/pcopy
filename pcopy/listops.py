@@ -4,7 +4,7 @@ import os
 from .qt import Qt, QtWidgets
 from .db import guess_root
 from .engine import part_path
-from .model import COPIED
+from .model import COPIED, FINISHED
 from .scanner import keep_existing
 
 
@@ -53,6 +53,7 @@ class ListMixin:
             return
         QtWidgets.QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
+            self.checker.stop()
             self.scanner.abort(timeout=5.0)
             self.scans.clear()
             held = list(self.engine.active)
@@ -76,6 +77,20 @@ class ListMixin:
             QtWidgets.QApplication.restoreOverrideCursor()
         self.status.showMessage(f"Liste geleert ({n} Einträge)"
                                 + (f", {removed} angefangene Hilfsdateien im Ziel gelöscht" if removed else ""), 10000)
+
+    def check_selected(self):
+        """Markierte fertige Dateien nachträglich von der Platte lesen und vergleichen."""
+        rows = [self.model.rows[self.model.idx[i]] for i in self.selected_ids()]
+        rows = [r for r in rows if r["status"] in FINISHED]
+        if not rows:
+            self.status.showMessage("Erst fertige oder übersprungene Dateien markieren.", 6000)
+            return
+        if not self.checker.busy():
+            self.checker.ok = self.checker.bad = 0
+        self.checker.add(rows)
+        self.checking = True
+        self.status.showMessage(f"{len(rows)} Dateien zur Prüfung vorgemerkt – werden nacheinander von der Platte "
+                                "gelesen und verglichen", 8000)
 
     def selected_ids(self):
         return [self.model.rows[i.row()]["id"] for i in self.table.selectionModel().selectedRows()]

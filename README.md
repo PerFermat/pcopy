@@ -16,6 +16,10 @@ Pause, Absturz oder abgezogener Platte exakt an der richtigen Stelle weitergehen
 - **Geprüft:** Jede Datei wird nach dem Sichern von der Platte zurückgelesen (am Seiten-Cache
   vorbei) und per SHA-256 mit der Quelle verglichen. Die Prüfsumme der Quelle entsteht beim
   Kopieren, die Quelle wird dafür nicht zusätzlich gelesen. Abschaltbar unter Einstellungen.
+- **Nachträglich prüfen:** Rechtsklick auf fertige oder übersprungene Dateien → „Prüfen“ liest
+  das Ziel erneut von der Platte und vergleicht es mit der gespeicherten Prüfsumme bzw. mit der
+  Quelle. Abweichende oder fehlende Dateien werden als Fehler markiert und lassen sich mit
+  „Erneut versuchen“ neu kopieren.
 - **Nie halbe Dateien unter echtem Namen:** Kopiert wird in eine versteckte Hilfsdatei
   `.NAME.pcopy-part`; erst wenn sie vollständig, gesichert und geprüft ist, wird sie in einem
   Schritt umbenannt. Eine Zieldatei, die ersetzt wird, bleibt bis dahin unverändert.
@@ -81,6 +85,7 @@ Die Job-Liste liegt als SQLite-Datenbank `pcopy.db` **neben dem Programm**. Eins
 | `pcopy/listops.py` | Entfernen, Leeren, erneut versuchen, Ziel umstellen |
 | `pcopy/engine.py` | Kopier-Threads, Tempo-Limit, Sichern, Prüfen, Hilfsdateien |
 | `pcopy/precheck.py` | Prüfung vor dem Start (Platz, FAT32-Grenzen) |
+| `pcopy/checker.py` | Nachträgliches Prüfen fertiger Dateien |
 | `pcopy/scanner.py` | Einlesen im Hintergrund, Regeln für vorhandene Dateien |
 | `pcopy/model.py` | Tabellenmodell und Fortschrittsbalken |
 | `pcopy/db.py` | Datenbank |

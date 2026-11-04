@@ -35,6 +35,10 @@ class MenuMixin:
                         "Fertige und übersprungene Einträge aus der Liste nehmen"))
         m.addAction(act("Fehlerhafte entfernen", "dialog-error", self.clear_failed))
         m.addSeparator()
+        m.addAction(act("Ausgewählte prüfen", "document-preview", self.check_selected,
+                        "Markierte fertige Dateien von der Platte lesen und mit der Quelle vergleichen",
+                        "Ctrl+Shift+P"))
+        m.addSeparator()
         m.addAction(act("Alles auswählen", "edit-select-all", self.table.selectAll, None, "Ctrl+A"))
         m.addSeparator()
         self.a_retarget = act("Zielordner aktualisieren", "folder-sync", self.retarget_selected,
@@ -92,6 +96,8 @@ class MenuMixin:
         a_tgt = m.addAction(QtGui.QIcon.fromTheme("folder-sync"),
                             f"Zielordner aktualisieren → {t}" if t else "Zielordner aktualisieren …")
         a_tgt.setEnabled(any(self.model.rows[self.model.idx[i]]["status"] == "pending" for i in ids))
+        a_check = m.addAction(QtGui.QIcon.fromTheme("document-preview"), "Prüfen (von der Platte lesen und vergleichen)")
+        a_check.setEnabled(any(self.model.rows[self.model.idx[i]]["status"] in ("done", "skipped") for i in ids))
         a_retry = m.addAction(QtGui.QIcon.fromTheme("view-refresh"), "Erneut versuchen")
         a_del = m.addAction(QtGui.QIcon.fromTheme("list-remove"), "Aus Liste entfernen")
         chosen = m.exec(self.table.viewport().mapToGlobal(pos))
@@ -100,6 +106,8 @@ class MenuMixin:
             QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(os.path.dirname(r["dst"])))
         elif chosen == a_src:
             QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(os.path.dirname(r["src"])))
+        elif chosen == a_check:
+            self.check_selected()
         elif chosen == a_retry:
             self.db.execute(f"UPDATE jobs SET status='pending', error=NULL WHERE status='failed' AND id IN ({q})", ids)
             self.model.load(self.db)
