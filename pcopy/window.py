@@ -164,6 +164,9 @@ class MainWindow(AddMixin, ListMixin, MenuMixin, FontMixin, QtWidgets.QMainWindo
         self.status = self.statusBar()
         self.scan_label = QtWidgets.QLabel()
         self.status.addPermanentWidget(self.scan_label)
+        self.par_label = QtWidgets.QLabel()
+        self.par_label.setStyleSheet("color:#b8860b")
+        self.status.addPermanentWidget(self.par_label)
         self._build_menu()
 
     # ---------------------------------------------------------------- Steuerung
@@ -260,6 +263,12 @@ class MainWindow(AddMixin, ListMixin, MenuMixin, FontMixin, QtWidgets.QMainWindo
         self.l_bytes.setText(f"{hsize(done)} / {hsize(total)}")
         self.l_speed.setText(f"{hsize(speed)}/s" if running else "–")
         self.l_eta.setText(htime((total - done) / speed) if running and speed else "–")
+
+        # „Gleichzeitig“ verkleinert: Angefangenes läuft zu Ende, Neues startet erst danach
+        n_act, n_max = len(self.engine.active), self.engine.n
+        self.par_label.setVisible(running and n_act > n_max)
+        if n_act > n_max:
+            self.par_label.setText(f"{n_act} angefangene Kopien laufen zu Ende – danach {n_max} gleichzeitig")
 
         busy = running and bool(self.engine.active)
         self.a_start.setEnabled(not running)

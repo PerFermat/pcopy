@@ -27,7 +27,23 @@ def db_connect(path=DB_PATH):
         c.execute("ALTER TABLE jobs ADD COLUMN speed REAL")     # Ø-Tempo (Bytes/s) einer fertigen Datei
     if "hash" not in cols:
         c.execute("ALTER TABLE jobs ADD COLUMN hash TEXT")      # SHA-256, wenn nach dem Kopieren geprüft
+        _adopt_partials(c)                                      # einmalig beim Umstieg auf Hilfsdateien
     return c
+
+
+def _adopt_partials(c):
+    """Ältere Versionen schrieben direkt in die Zieldatei. Angefangene Kopien von dort einmalig in
+    die Hilfsdatei umbenennen, damit sie fortgesetzt statt neu kopiert werden. Die SHA-256-Prüfung
+    nach dem Kopieren liest auch den schon vorhandenen Anfang mit und deckt Abweichungen auf."""
+    from .engine import part_path
+    rows = c.execute("SELECT id,dst,offset FROM jobs WHERE status IN ('pending','running') AND offset>0").fetchall()
+    for jid, dst, offset in rows:
+        part = part_path(dst, jid)
+        try:
+            if not os.path.exists(part) and os.path.getsize(dst) >= offset:
+                os.rename(dst, part)
+        except OSError:
+            pass
 
 
 def guess_root(src, dst):
