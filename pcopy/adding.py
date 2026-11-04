@@ -61,7 +61,8 @@ class AddMixin:
             return
         self.scan_nr += 1
         self.scans[self.scan_nr] = dict(seen=0, new=0)
-        self.scanner.add(self.scan_nr, list(paths), target, self.existing.currentData())
+        self.scanner.add(self.scan_nr, list(paths), target, self.existing.currentData(),
+                         self.action.currentData(), self.exclude_patterns())
         self.tick()
 
     def drain_scanner(self):
@@ -78,7 +79,12 @@ class AddMixin:
                 continue
             st = data
             del self.scans[rid]
-            msg = f"{st['new'] - st['skipped']} Dateien ({hsize(st['total'])}) hinzugefügt"
+            verb = "zum Verschieben" if self.action.currentData() == "move" else "hinzugefügt"
+            msg = f"{st['new'] - st['skipped'] - st['delete']} Dateien ({hsize(st['total'])}) {verb}"
+            if st["delete"]:
+                msg += f", {st['delete']} Einträge im Ziel werden gelöscht (Spiegeln – vor dem Start prüfen!)"
+            if st["excluded"]:
+                msg += f", {st['excluded']} ausgeschlossen"
             if st["skipped"]:
                 msg += f", {st['skipped']} übersprungen (im Ziel schon vorhanden)"
             if st["dup"]:

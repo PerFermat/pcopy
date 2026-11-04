@@ -81,7 +81,7 @@ class ListMixin:
     def check_selected(self):
         """Markierte fertige Dateien nachträglich von der Platte lesen und vergleichen."""
         rows = [self.model.rows[self.model.idx[i]] for i in self.selected_ids()]
-        rows = [r for r in rows if r["status"] in FINISHED]
+        rows = [r for r in rows if r["status"] in FINISHED and r.get("kind") != "delete"]
         if not rows:
             self.status.showMessage("Erst fertige oder übersprungene Dateien markieren.", 6000)
             return
@@ -91,6 +91,33 @@ class ListMixin:
         self.checking = True
         self.status.showMessage(f"{len(rows)} Dateien zur Prüfung vorgemerkt – werden nacheinander von der Platte "
                                 "gelesen und verglichen", 8000)
+
+    def prioritize(self, on=True):
+        """Markierte wartende Dateien als Nächstes kopieren (bzw. den Vorrang wieder entfernen)."""
+        ids = [i for i in self.selected_ids() if self.model.rows[self.model.idx[i]]["status"] == "pending"]
+        if not ids:
+            self.status.showMessage("Erst wartende Dateien markieren.", 6000)
+            return
+        q = ",".join("?" * len(ids))
+        if on:
+            # höher als alles bisher: die zuletzt vorgezogenen kommen zuerst dran
+            top = (self.db.execute("SELECT MAX(prio) FROM jobs").fetchone()[0] or 0) + 1
+            self.db.execute(f"UPDATE jobs SET prio=? WHERE status='pending' AND id IN ({q})", [top] + ids)
+        else:
+            top = 0
+            self.db.execute(f"UPDATE jobs SET prio=0 WHERE id IN ({q})", ids)
+        for i in ids:
+            self.model.update(i, prio=top)
+        if on:
+            # in der Anzeige an die Spitze der wartenden Dateien
+            rows = self.model.rows
+            want = set(ids)
+            b = next((k for k, r in enumerate(rows) if r["status"] == "pending" and r["id"] not in want), len(rows))
+            for jid in sorted(ids, key=lambda j: self.model.idx[j], reverse=True):
+                i = self.model.idx[jid]
+                self.model.move_row(i, b - 1 if i < b else b)
+            self.table.scrollTo(self.model.index(self.model.idx[ids[0]], 0))
+        self.status.showMessage(f"{len(ids)} Dateien " + ("werden als Nächstes kopiert" if on else "ohne Vorrang"), 8000)
 
     def selected_ids(self):
         return [self.model.rows[i.row()]["id"] for i in self.table.selectionModel().selectedRows()]
@@ -112,7 +139,7 @@ class ListMixin:
             self.db.execute("BEGIN")
             try:
                 rows = self.db.execute(f"SELECT id,src,dst,root,offset,size FROM jobs "
-                                       f"WHERE status='pending' AND id IN ({q})", ids).fetchall()
+                                       f"WHERE status='pending' AND kind!='delete' AND id IN ({q})", ids).fetchall()
                 for jid, src, dst, root, off, size in rows:
                     if jid in self.engine.active:
                         continue

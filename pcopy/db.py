@@ -30,6 +30,10 @@ def db_connect(path=DB_PATH):
         _adopt_partials(c)                                      # einmalig beim Umstieg auf Hilfsdateien
     if "kind" not in cols:
         c.execute("ALTER TABLE jobs ADD COLUMN kind TEXT DEFAULT 'file'")  # file, dir (leerer Ordner), link
+    if "action" not in cols:
+        c.execute("ALTER TABLE jobs ADD COLUMN action TEXT DEFAULT 'copy'")  # copy oder move (Quelle danach weg)
+    if "prio" not in cols:
+        c.execute("ALTER TABLE jobs ADD COLUMN prio INTEGER DEFAULT 0")      # Vorrang: höher = früher
     if "tries" not in cols:
         c.execute("ALTER TABLE jobs ADD COLUMN tries INTEGER DEFAULT 0")   # automatische Wiederholungen
         c.execute("ALTER TABLE jobs ADD COLUMN retry_at REAL")             # frühester neuer Versuch (Unix-Zeit)

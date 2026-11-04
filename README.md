@@ -27,6 +27,18 @@ Pause, Absturz oder abgezogener Platte exakt an der richtigen Stelle weitergehen
   Zeichen, die FAT32/exFAT in Namen nicht erlauben (`< > : " \ | ? *`) sowie symbolische Links,
   die FAT32/exFAT nicht speichern können. Betroffene Dateien
   lassen sich überspringen, der Rest wird kopiert.
+- **Aktion pro Hinzufügen:** *Kopieren*, *Verschieben* oder *Spiegeln* (steht nach jedem Start
+  wieder auf Kopieren).
+  - Verschieben: Die Quelle wird erst gelöscht, wenn die Kopie gesichert und per SHA-256 geprüft
+    ist (immer, auch wenn die Prüfung sonst aus ist); auf demselben Laufwerk wird nur umbenannt.
+    Leere Quellordner werden am Ende entfernt; im Ziel schon vorhandene, übersprungene Dateien
+    bleiben in der Quelle.
+  - Spiegeln: kopieren und alles, was im Ziel liegt, in der Quelle aber fehlt, als „wird gelöscht“
+    auflisten – vor dem Start sichtbar und einzeln abwählbar. Gelöscht wird in den Papierkorb
+    (`gio trash`), nie endgültig; Ausgeschlossenes und Hilfsdateien bleiben unangetastet.
+- **Ausschlussfilter** (Einstellungen → Ausschließen…): Muster wie `*.tmp`, `.thumbnails`,
+  `Fotos/Cache`; Vorschläge inkl. Nextcloud-Hilfsdateien sind schon eingetragen (auskommentiert).
+- **Vorrang:** Rechtsklick → „Als Nächstes kopieren“ (Strg+↑) zieht markierte wartende Dateien vor.
 - **Vollständige Ordner:** leere Ordner werden mitkopiert, symbolische Links als Links (auch
   Links auf Ordner und Links ins Leere), und am Ende übernimmt pcopy Zeitstempel und Rechte der
   Ordner – von innen nach außen, damit das Anlegen der Dateien sie nicht wieder verändert.

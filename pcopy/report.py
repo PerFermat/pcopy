@@ -10,12 +10,19 @@ SHOW_MAX = 500            # so viele Fehler/Übersprungene zeigt das Fenster (di
 
 
 def collect(db):
-    rows = db.execute("SELECT status,src,dst,size,hash,error,tries FROM jobs ORDER BY id").fetchall()
-    s = dict(verified=[0, 0], unverified=[0, 0], skipped=[0, 0], skipped_ok=0, failed=[], open=[0, 0])
+    rows = db.execute("SELECT status,src,dst,size,hash,error,tries,kind,action FROM jobs ORDER BY id").fetchall()
+    s = dict(verified=[0, 0], unverified=[0, 0], skipped=[0, 0], skipped_ok=0, failed=[], open=[0, 0],
+             moved=0, deleted=0, notes=[])
     skipped = []
-    for status, src, dst, size, h, err, tries in rows:
+    for status, src, dst, size, h, err, tries, kind, action in rows:
         size = size or 0
+        if status == "done" and kind == "delete":
+            s["deleted"] += 1
+            continue
         if status == "done":
+            s["moved"] += action == "move"
+            if err:
+                s["notes"].append((dst, err))
             k = "verified" if h else "unverified"
             s[k][0] += 1
             s[k][1] += size
@@ -40,6 +47,8 @@ def as_text(db, limit=None):
            f"  fertig, nicht geprüft:    {s['unverified'][0]:>7}  ({hsize(s['unverified'][1])})",
            f"  übersprungen (vorhanden): {s['skipped'][0]:>7}  ({hsize(s['skipped'][1])})"
            + (f", davon {s['skipped_ok']} geprüft" if s["skipped_ok"] else ""),
+           f"  davon verschoben:         {s['moved']:>7}",
+           f"  im Ziel gelöscht (Spiegeln, Papierkorb): {s['deleted']}",
            f"  Fehler:                   {len(s['failed']):>7}",
            f"  noch offen:               {s['open'][0]:>7}  ({hsize(s['open'][1])})", ""]
     if s["failed"]:
@@ -48,6 +57,10 @@ def as_text(db, limit=None):
             out.append(f"  {dst}\n      {err}\n      Quelle: {src}")
         if limit and len(s["failed"]) > limit:
             out.append(f"  … und {len(s['failed']) - limit} weitere (vollständig in der gespeicherten Datei)")
+        out.append("")
+    if s["notes"]:
+        out.append(f"Hinweise ({len(s['notes'])}):")
+        out += [f"  {d}\n      {e}" for d, e in s["notes"][:limit]]
         out.append("")
     if skipped:
         out.append(f"Übersprungen, weil im Ziel schon vorhanden ({len(skipped)}):")
@@ -60,9 +73,9 @@ def as_text(db, limit=None):
 def save_csv(db, path):
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f, delimiter=";")
-        w.writerow(["Status", "Quelle", "Ziel", "Größe (Bytes)", "SHA-256", "Fehler", "Wiederholungen"])
-        for status, src, dst, size, h, err, tries in collect(db)[0]:
-            w.writerow([status, src, dst, size, h or "", err or "", tries or 0])
+        w.writerow(["Status", "Art", "Aktion", "Quelle", "Ziel", "Größe (Bytes)", "SHA-256", "Fehler", "Wiederholungen"])
+        for status, src, dst, size, h, err, tries, kind, action in collect(db)[0]:
+            w.writerow([status, kind or "file", action or "copy", src, dst, size, h or "", err or "", tries or 0])
 
 
 class ReportDialog(QtWidgets.QDialog):

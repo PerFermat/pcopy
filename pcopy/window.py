@@ -15,7 +15,7 @@ from .menus import MenuMixin
 from . import precheck
 from .report import ReportDialog
 from .model import BarDelegate, CHECKING, DropTable, FINISHED, JobModel
-from .scanner import EXISTING, Scanner
+from .scanner import ACTIONS, EXISTING, Scanner, parse_patterns
 from .util import hsize, htime
 
 APP = "pcopy"
@@ -135,6 +135,19 @@ class MainWindow(AddMixin, ListMixin, MenuMixin, FontMixin, QtWidgets.QMainWindo
         i = self.existing.findData(self.settings.value("existing", "skip"))
         self.existing.setCurrentIndex(max(i, 0))
         row.addWidget(self.existing)
+        row.addSpacing(16)
+        row.addWidget(QtWidgets.QLabel("Aktion:"))
+        self.action = QtWidgets.QComboBox()
+        for key, text in ACTIONS:
+            self.action.addItem(text, key)
+        self.action.setToolTip("Gilt für Dateien, die ab jetzt hinzugefügt werden – steht nach jedem Programmstart "
+                               "wieder auf „Kopieren“.\n\n"
+                               "Verschieben: Quelle wird erst gelöscht, wenn die Kopie gesichert und per SHA-256 "
+                               "geprüft ist\n(auf demselben Laufwerk: einfach umbenannt).\n"
+                               "Spiegeln: kopieren und zusätzlich alles, was im Ziel liegt, in der Quelle aber "
+                               "fehlt,\nals „wird gelöscht“ in die Liste aufnehmen – gelöscht wird in den Papierkorb.")
+        self.action.currentIndexChanged.connect(self._action_changed)
+        row.addWidget(self.action)
         lay.addLayout(row)
 
         # Tabelle
@@ -191,6 +204,19 @@ class MainWindow(AddMixin, ListMixin, MenuMixin, FontMixin, QtWidgets.QMainWindo
         self.engine.start(self.spin.value())
         self.tick()
 
+    def _action_changed(self):
+        key = self.action.currentData()
+        self.action.setStyleSheet("" if key == "copy" else "QComboBox { background:#f6d58a; color:black; }")
+        if key == "move":
+            self.status.showMessage("Verschieben: neu hinzugefügte Dateien werden nach dem Kopieren und Prüfen "
+                                    "in der Quelle gelöscht", 10000)
+        elif key == "mirror":
+            self.status.showMessage("Spiegeln: was im Ziel liegt, in der Quelle aber fehlt, wird beim Hinzufügen "
+                                    "eines Ordners als „wird gelöscht“ aufgelistet", 10000)
+
+    def exclude_patterns(self):
+        return parse_patterns(self.settings.value("exclude", ""))
+
     def hint_hdds(self):
         """Beim Start sagen, wenn ein Ziel eine Festplatte ist und deshalb nacheinander kopiert wird."""
         if not self.hdd_serial.isChecked() or self.spin.value() < 2:
@@ -217,7 +243,7 @@ class MainWindow(AddMixin, ListMixin, MenuMixin, FontMixin, QtWidgets.QMainWindo
         """Platz, 4-GB-Grenze (FAT32) und erlaubte Zeichen vor dem Start prüfen.
         False = abgebrochen. Nicht anlegbare Dateien werden auf Wunsch als Fehler markiert."""
         try:
-            msgs, affected = precheck.check(self.db)
+            msgs, affected, space = precheck.check(self.db)
         except Exception as e:                   # Prüfung darf das Kopieren nie verhindern
             self.status.showMessage(f"Prüfung vor dem Start nicht möglich: {e}", 8000)
             return True
@@ -226,8 +252,8 @@ class MainWindow(AddMixin, ListMixin, MenuMixin, FontMixin, QtWidgets.QMainWindo
         box = QtWidgets.QMessageBox(QtWidgets.QMessageBox.Icon.Warning, "Vor dem Start",
                                     "<br><br>".join(msgs), parent=self)
         box.setTextFormat(Qt.TextFormat.RichText)
-        go = box.addButton("Betroffene überspringen und starten" if affected else "Trotzdem starten",
-                           QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        go = box.addButton("Betroffene überspringen und starten" if affected else
+                           "Trotzdem starten" if space else "Starten", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
         box.addButton("Abbrechen", QtWidgets.QMessageBox.ButtonRole.RejectRole)
         box.exec()
         if box.clickedButton() is not go:

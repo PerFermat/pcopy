@@ -17,6 +17,7 @@ import hashlib
 import os
 import queue
 import shutil
+import subprocess
 import threading
 import time
 from collections import deque
@@ -162,6 +163,7 @@ class Engine:
         self.wlock = threading.Lock()
         self.sync_lock = threading.Lock()
         self.touched = {}         # Zielordner -> Quellordner, deren Zeitstempel am Ende gesetzt werden
+        self.rm_dirs = set()      # Quellordner verschobener Dateien – am Ende entfernen, wenn leer
         self.tlock = threading.Lock()
         self.stamping = False
         threading.Thread(target=self._syncer, daemon=True).start()
@@ -280,8 +282,8 @@ class Engine:
             c = c or db_connect()
             ok, bad = [], []                     # bad: (jid, part, fehlertext, wiederholen?)
             try:
-                self._sync_dirs(p for _, p, _, _ in batch)           # Daten sicher auf der Platte
-                for jid, part, dst, digest in batch:
+                self._sync_dirs(p for _, p, _, _, _ in batch)        # Daten sicher auf der Platte
+                for jid, part, dst, digest, _ in batch:
                     try:
                         if self.gentle and digest is None:
                             with open(part, "rb") as f:
@@ -295,10 +297,10 @@ class Engine:
                         bad.append((jid, part, e.strerror or str(e), e.errno in TRANSIENT))
                 if ok:
                     done = set(ok)
-                    self._sync_dirs(dst for jid, _, dst, _ in batch if jid in done)       # Umbenennungen
+                    self._sync_dirs(dst for jid, _, dst, _, _ in batch if jid in done)    # Umbenennungen
             except OSError as e:
                 # nicht sicher geschrieben -> neu kopieren (bei vorübergehenden Fehlern später erneut)
-                for jid, _, _, _ in batch:
+                for jid, _, _, _, _ in batch:
                     self._fail(c, jid, f"Sichern fehlgeschlagen: {e.strerror or e}",
                                retry=e.errno in TRANSIENT, restart=True)
                 return
@@ -308,6 +310,11 @@ class Engine:
             c.execute("COMMIT")
             for jid in ok:
                 self.events.put((jid, {"status": "done", "tries": 0, "retry_at": None}))
+            ok_set = set(ok)
+            moved = {jid: src for jid, _, _, _, src in batch if src and jid in ok_set}
+            for jid, src in moved.items():                                     # Verschieben: Quelle weg
+                act = Active(jid, src, "", 0)
+                self._remove_source(c, act)
             for jid, part, msg, retry in bad:
                 try:
                     os.remove(part)
@@ -330,8 +337,9 @@ class Engine:
         """Nächste wartende Datei übernehmen – aber keine, deren Festplatte schon beschäftigt ist:
         mehrere Kopien gleichzeitig lassen den Lesekopf springen und machen alles langsamer."""
         with self.claim_lock:
-            rows = c.execute("SELECT id,src,dst,size,mtime,offset,kind,root FROM jobs WHERE status='pending' "
-                             "AND (retry_at IS NULL OR retry_at <= ?) ORDER BY id LIMIT 64", (time.time(),)).fetchall()
+            rows = c.execute("SELECT id,src,dst,size,mtime,offset,kind,root,action FROM jobs WHERE status='pending' "
+                             "AND (retry_at IS NULL OR retry_at <= ?) ORDER BY prio DESC, id LIMIT 64",
+                             (time.time(),)).fetchall()
             for row in rows:
                 hdds = self._hdds(row[1], row[2])
                 if any(self.dev_busy.get(d, 0) >= 1 for d in hdds):
@@ -358,19 +366,23 @@ class Engine:
                     self._stamp_dirs(c)
                 stop.wait(0.5)
                 continue
-            jid, src, dst, size, mtime, offset, kind, root, hdds = job
+            jid, src, dst, size, mtime, offset, kind, root, action, hdds = job
+            move = action == "move"
+            root = root or guess_root(src, dst)
             act = Active(jid, src, dst, size)
             self.active[jid] = act
             self.events.put((jid, {"status": "running"}))
             try:
                 if kind == "dir":
-                    result, digest = self._mkdir(c, act)
+                    result, digest = self._mkdir(c, act, move)
                 elif kind == "link":
-                    result, digest = self._link(c, act)
+                    result, digest = self._link(c, act, move)
+                elif kind == "delete":
+                    result, digest = self._delete(c, act, root)
                 else:
-                    result, digest = self._copy(c, act, mtime, offset, stop)
+                    result, digest = self._copy(c, act, mtime, offset, stop, move)
                 if result:
-                    self._touch(src, dst, root or guess_root(src, dst), kind)
+                    self._touch(src, dst, root, kind, move)
                     self.events.put((jid, {"status": result, "offset": act.size, "size": act.size, "error": None,
                                            "speed": act.avg, "hash": digest, "retry_at": None,
                                            **({"tries": 0} if result == "done" else {})}))
@@ -390,45 +402,85 @@ class Engine:
                     self.active.pop(jid, None)
 
     # ---------------------------------------------------------------- Ordner und Links
-    def _touch(self, src, dst, root, kind):
-        """Ordner unterhalb des Zielordners merken, deren Zeitstempel am Ende übernommen werden."""
+    def _touch(self, src, dst, root, kind, move=False):
+        """Ordner unterhalb des Zielordners merken, deren Zeitstempel am Ende übernommen werden –
+        beim Verschieben auch die Quellordner, die danach leer sein könnten."""
         root = os.path.normpath(root)
         sd, dd = (src, dst) if kind == "dir" else (os.path.dirname(src), os.path.dirname(dst))
         with self.tlock:
             while os.path.normpath(dd) != root and dd.startswith(root + os.sep):
-                if dd in self.touched:
+                if move:
+                    self.rm_dirs.add(sd)
+                elif dd in self.touched:
                     break                          # Rest der Kette ist schon gemerkt
-                self.touched[dd] = sd
+                self.touched.setdefault(dd, sd)
                 sd, dd = os.path.dirname(sd), os.path.dirname(dd)
 
     def dirs_pending(self):
-        return self.stamping or bool(self.touched)
+        return self.stamping or bool(self.touched) or bool(self.rm_dirs)
 
     def _stamp_dirs(self, c):
         """Ist alles kopiert und gesichert, Zeitstempel und Rechte der Ordner übernehmen – von innen
         nach außen, denn jede neue Datei hätte den Zeitstempel ihres Ordners wieder verändert."""
-        if not self.touched or self.active or self.unsynced() or \
+        if not (self.touched or self.rm_dirs) or self.active or self.unsynced() or \
                 c.execute("SELECT 1 FROM jobs WHERE status IN ('pending','running','written') LIMIT 1").fetchone():
             return
         self.stamping = True
         try:
             with self.tlock:
                 pairs, self.touched = self.touched, {}
+                gone, self.rm_dirs = self.rm_dirs, set()
             for dd in sorted(pairs, key=lambda p: p.count(os.sep), reverse=True):
                 try:
                     shutil.copystat(pairs[dd], dd)
                 except OSError:
                     pass                           # z. B. FAT: keine Rechte – Zeiten sind dann trotzdem gesetzt
+            for sd in sorted(gone, key=lambda p: p.count(os.sep), reverse=True):
+                try:
+                    os.rmdir(sd)                   # nur leere Ordner – sonst bleibt er einfach stehen
+                except OSError:
+                    pass
         finally:
             self.stamping = False
 
-    def _mkdir(self, c, act):
-        """Leerer Ordner."""
-        os.makedirs(act.dst, exist_ok=True)
+    def _remove_source(self, c, act):
+        """Verschieben: Quelle löschen, nachdem die Kopie gesichert (und geprüft) ist."""
+        try:
+            if os.path.isdir(act.src) and not os.path.islink(act.src):
+                os.rmdir(act.src)
+            else:
+                os.remove(act.src)
+        except OSError as e:
+            msg = f"Kopiert, aber Quelle nicht gelöscht: {e.strerror or e}"
+            c.execute("UPDATE jobs SET error=? WHERE id=?", (msg, act.id))
+            self.events.put((act.id, {"error": msg}))
+
+    def _delete(self, c, act, root):
+        """Spiegeln: Eintrag im Ziel, den es in der Quelle nicht mehr gibt, in den Papierkorb."""
+        dst = os.path.normpath(act.dst)
+        if not dst.startswith(os.path.normpath(root) + os.sep):
+            raise RuntimeError("Sicherheitsstopp: Ziel liegt nicht im Zielordner – nichts gelöscht")
+        if os.path.lexists(act.src):
+            raise RuntimeError("Nicht gelöscht: gibt es in der Quelle inzwischen wieder")
+        if os.path.lexists(dst):
+            gio = shutil.which("gio")
+            if gio is None:
+                raise RuntimeError("Nicht gelöscht: Papierkorb nicht verfügbar (Programm „gio“ fehlt)")
+            r = subprocess.run([gio, "trash", "--", dst], capture_output=True, text=True, timeout=300)
+            if r.returncode != 0:
+                raise RuntimeError(f"Nicht in den Papierkorb verschoben: {(r.stderr or '').strip() or r.returncode}")
         c.execute("UPDATE jobs SET status='done', error=NULL, tries=0, retry_at=NULL WHERE id=?", (act.id,))
         return "done", None
 
-    def _link(self, c, act):
+    def _mkdir(self, c, act, move=False):
+        """Leerer Ordner."""
+        os.makedirs(act.dst, exist_ok=True)
+        if move:
+            self._remove_source(c, act)
+        c.execute("UPDATE jobs SET status='done', error=NULL, tries=0, retry_at=NULL WHERE id=?", (act.id,))
+        return "done", None
+
+    def _link(self, c, act, move=False):
         """Symbolischen Link als Link anlegen: erst unter Hilfsnamen, dann umbenennen (ersetzt atomar)."""
         target = os.readlink(act.src)
         d = os.path.dirname(act.dst)
@@ -448,6 +500,8 @@ class Engine:
         os.replace(tmp, act.dst)
         fsync_dir(d)
         c.execute("UPDATE jobs SET status='done', error=NULL, hash=NULL, tries=0, retry_at=NULL WHERE id=?", (act.id,))
+        if move:
+            self._remove_source(c, act)
         return "done", None
 
     def _fail(self, c, jid, msg, retry, restart=False):
@@ -472,8 +526,22 @@ class Engine:
             kw["offset"] = (c.execute("SELECT offset FROM jobs WHERE id=?", (jid,)).fetchone() or [0])[0]
         self.events.put((jid, kw))
 
-    def _copy(self, c, act, mtime, offset, stop):
+    def _copy(self, c, act, mtime, offset, stop, move=False):
         """Rückgabe (status, sha256) mit status „done“/„written“, oder (None, None) bei Pause."""
+        if move and self.devices.dev(act.src) == self.devices.dev(act.dst) >= 0:
+            # Verschieben auf demselben Laufwerk: umbenennen genügt – sofort, ohne Kopie
+            os.makedirs(os.path.dirname(act.dst), exist_ok=True)
+            try:
+                os.replace(act.src, act.dst)
+            except OSError as e:
+                if e.errno != errno.EXDEV:             # z. B. Bind-Mount: dann eben kopieren
+                    raise
+            else:
+                fsync_dir(os.path.dirname(act.dst))
+                fsync_dir(os.path.dirname(act.src))
+                c.execute("UPDATE jobs SET status='done', offset=size, error=NULL, hash=NULL, tries=0, "
+                          "retry_at=NULL WHERE id=?", (act.id,))
+                return "done", None
         st = os.stat(act.src)
         if st.st_size != act.size or abs(st.st_mtime - mtime) > 1e-3:
             offset, act.size = 0, st.st_size        # Quelle geändert -> neu
@@ -484,7 +552,7 @@ class Engine:
         if offset > 0 and (not os.path.exists(part) or os.path.getsize(part) < offset):
             offset = 0
         act.copied = act.base = offset
-        h = hashlib.sha256() if self.verify else None
+        h = hashlib.sha256() if self.verify or move else None   # Verschieben: immer prüfen
 
         def pause(fd):
             fd.flush(); os.fsync(fd.fileno())
@@ -558,7 +626,7 @@ class Engine:
                       "WHERE id=?",
                       (act.avg, digest, act.id))
             with self.wlock:
-                self.written.append((act.id, part, act.dst, digest))
+                self.written.append((act.id, part, act.dst, digest, act.src if move else None))
                 if self.written_since is None:
                     self.written_since = time.monotonic()
             return "written", digest
@@ -579,4 +647,6 @@ class Engine:
         fsync_dir(os.path.dirname(act.dst))
         c.execute("UPDATE jobs SET status='done', offset=size, error=NULL, speed=?, hash=?, tries=0, retry_at=NULL "
                   "WHERE id=?", (act.avg, digest, act.id))
+        if move:
+            self._remove_source(c, act)
         return "done", digest

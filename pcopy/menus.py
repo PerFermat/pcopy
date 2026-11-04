@@ -5,6 +5,21 @@ from .qt import QtCore, QtGui, QtWidgets
 from .db import DB_PATH
 from .scanner import EXISTING
 
+EXCLUDE_EXAMPLES = """# Beispiele – Raute (#) am Zeilenanfang entfernen, um ein Muster zu aktivieren:
+# *.tmp
+# *.part
+# *.crdownload
+# .~lock.*#
+# Thumbs.db
+# .DS_Store
+# .thumbnails
+# .cache
+# Nextcloud-Hilfsdateien:
+# .sync_*.db*
+# .owncloudsync.log*
+# .nextcloudsync.log*
+"""
+
 
 class MenuMixin:
     def _build_menu(self):
@@ -38,6 +53,8 @@ class MenuMixin:
                         "Fertige und übersprungene Einträge aus der Liste nehmen"))
         m.addAction(act("Fehlerhafte entfernen", "dialog-error", self.clear_failed))
         m.addSeparator()
+        m.addAction(act("Als Nächstes kopieren", "go-top", lambda: self.prioritize(True),
+                        "Markierte wartende Dateien vorziehen", "Ctrl+Up"))
         m.addAction(act("Ausgewählte prüfen", "document-preview", self.check_selected,
                         "Markierte fertige Dateien von der Platte lesen und mit der Quelle vergleichen",
                         "Ctrl+Shift+P"))
@@ -79,6 +96,8 @@ class MenuMixin:
         self.follow.setChecked(self.settings.value("follow", "true") == "true")
         self.follow.toggled.connect(lambda on: on and self.shown_active.clear())
         m.addSeparator()
+        m.addAction(act("Ausschließen…", "view-filter", self.edit_excludes,
+                        "Muster für Dateien und Ordner, die nicht kopiert werden (z. B. *.tmp, .thumbnails)"))
         sub = m.addMenu("Vorhandene Dateien")
         grp = QtGui.QActionGroup(self)
         modes = []
@@ -100,6 +119,20 @@ class MenuMixin:
             "Abbruch, Pause oder Absturz: beim nächsten Start geht es an derselben Stelle weiter.<br>"
             f"Liste: <code>{DB_PATH}</code>")))
 
+    def edit_excludes(self):
+        text = self.settings.value("exclude", "") or EXCLUDE_EXAMPLES
+        new, ok = QtWidgets.QInputDialog.getMultiLineText(
+            self, "Ausschließen",
+            "Muster, die beim Hinzufügen übersprungen werden – eins pro Zeile, # = Kommentar.\n"
+            "Ohne „/“: gilt für Datei- und Ordnernamen überall (*, ? als Platzhalter).\n"
+            "Mit „/“: gilt für den Pfad im hinzugefügten Ordner, z. B. Fotos/Cache\n"
+            "Ausgeschlossene Dateien werden beim Spiegeln im Ziel auch nicht gelöscht.", text)
+        if ok:
+            self.settings.setValue("exclude", new)
+            n = len(self.exclude_patterns())
+            self.status.showMessage(f"{n} Ausschlussmuster aktiv – gilt für Dateien, die ab jetzt hinzugefügt werden",
+                                    8000)
+
     def context_menu(self, pos):
         ids = self.selected_ids()
         if not ids:
@@ -113,6 +146,12 @@ class MenuMixin:
         a_tgt = m.addAction(QtGui.QIcon.fromTheme("folder-sync"),
                             f"Zielordner aktualisieren → {t}" if t else "Zielordner aktualisieren …")
         a_tgt.setEnabled(any(self.model.rows[self.model.idx[i]]["status"] == "pending" for i in ids))
+        sel = [self.model.rows[self.model.idx[i]] for i in ids]
+        a_prio = m.addAction(QtGui.QIcon.fromTheme("go-top"), "Als Nächstes kopieren")
+        a_prio.setEnabled(any(r["status"] == "pending" for r in sel))
+        a_unprio = m.addAction(QtGui.QIcon.fromTheme("go-bottom"), "Vorrang entfernen")
+        a_unprio.setEnabled(any(r["status"] == "pending" and r.get("prio") for r in sel))
+        m.addSeparator()
         a_check = m.addAction(QtGui.QIcon.fromTheme("document-preview"), "Prüfen (von der Platte lesen und vergleichen)")
         a_check.setEnabled(any(self.model.rows[self.model.idx[i]]["status"] in ("done", "skipped") for i in ids))
         a_retry = m.addAction(QtGui.QIcon.fromTheme("view-refresh"), "Erneut versuchen")
@@ -123,6 +162,10 @@ class MenuMixin:
             QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(os.path.dirname(r["dst"])))
         elif chosen == a_src:
             QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(os.path.dirname(r["src"])))
+        elif chosen == a_prio:
+            self.prioritize(True)
+        elif chosen == a_unprio:
+            self.prioritize(False)
         elif chosen == a_check:
             self.check_selected()
         elif chosen == a_retry:

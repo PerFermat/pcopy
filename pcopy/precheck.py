@@ -59,9 +59,13 @@ def check(db):
     mounts = _mounts()
     targets, by_dev, affected = {}, {}, {}
     too_big, bad_name = [], []
-    links = []
-    rows = db.execute("SELECT id,src,dst,root,size,offset,kind FROM jobs WHERE status='pending'").fetchall()
-    for jid, src, dst, root, size, offset, kind in rows:
+    links, deletes, moves = [], [], 0
+    rows = db.execute("SELECT id,src,dst,root,size,offset,kind,action FROM jobs WHERE status='pending'").fetchall()
+    for jid, src, dst, root, size, offset, kind, action in rows:
+        if kind == "delete":
+            deletes.append(dst)
+            continue
+        moves += action == "move"
         root = root or guess_root(src, dst)
         t = targets.get(root)
         if t is None:
@@ -87,9 +91,16 @@ def check(db):
                 continue
         t.need += (size or 0) - (offset or 0)
 
-    msgs = []
+    msgs, space = [], False
+    if deletes:
+        msgs.append(f"<b>Spiegeln: {len(deletes)} Einträge im Ziel werden in den Papierkorb verschoben</b>, weil es "
+                    "sie in der Quelle nicht mehr gibt: " + _examples(deletes) +
+                    "<br>Einzelne Einträge vorher per Rechtsklick → „Aus Liste entfernen“ ausnehmen.")
+    if moves:
+        msgs.append(f"<b>Verschieben: {moves} Dateien</b> werden nach dem Kopieren und Prüfen in der Quelle gelöscht.")
     for t in by_dev.values():
         if t.need > t.free:
+            space = True
             msgs.append(f"<b>Zu wenig Platz</b> auf {t.mount}: benötigt ca. {hsize(t.need)}, frei {hsize(t.free)}."
                         " (Dateien, die ersetzt werden, sind nicht abgezogen.)")
     if too_big:
@@ -101,7 +112,7 @@ def check(db):
     if bad_name:
         msgs.append(f"<b>{len(bad_name)} Datei- oder Ordnernamen</b> enthalten Zeichen, die das Ziel nicht "
                     "erlaubt (&lt; &gt; : \" \\ | ? *): " + _examples(bad_name))
-    return msgs, affected
+    return msgs, affected, space
 
 
 def _examples(names, n=4):

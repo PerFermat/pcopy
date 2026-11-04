@@ -34,9 +34,10 @@ class JobModel(QtCore.QAbstractTableModel):
     def load(self, c):
         self.beginResetModel()
         self.rows = [dict(id=r[0], src=r[1], dst=r[2], size=r[3] or 0, offset=r[4] or 0, status=r[5], error=r[6],
-                          speed=r[7], hash=r[8], tries=r[9] or 0, retry_at=r[10], kind=r[11] or "file")
-                     for r in c.execute("SELECT id,src,dst,size,offset,status,error,speed,hash,tries,retry_at,kind "
-                                        "FROM jobs ORDER BY id")]
+                          speed=r[7], hash=r[8], tries=r[9] or 0, retry_at=r[10], kind=r[11] or "file",
+                          action=r[12] or "copy", prio=r[13] or 0)
+                     for r in c.execute("SELECT id,src,dst,size,offset,status,error,speed,hash,tries,retry_at,kind,"
+                                        "action,prio FROM jobs ORDER BY id")]
         self.idx = {r["id"]: i for i, r in enumerate(self.rows)}
         self.live.clear()
         self.endResetModel()
@@ -99,19 +100,30 @@ class JobModel(QtCore.QAbstractTableModel):
         _, speed, verified = self.live.get(r["id"], (0, 0, None))
         if st in ("verifying", "checking") and verified is not None and r["size"]:
             frac = verified / r["size"]              # Balken zeigt den Fortschritt des Prüfens
+        kind = r.get("kind", "file")
         if role == Qt.ItemDataRole.DisplayRole:
-            kind = r.get("kind", "file")
             if col == 0: return os.path.basename(r["src"]) + ("/" if kind == "dir" else "")
             if col == 1: return os.path.dirname(r["dst"])
-            if col == 2: return {"dir": "Ordner (leer)", "link": "Link"}.get(kind) or hsize(r["size"])
+            if col == 2:
+                if kind == "delete":
+                    return "löschen" + (f" ({hsize(r['size'])})" if r["size"] else "")
+                return {"dir": "Ordner (leer)", "link": "Link"}.get(kind) or hsize(r["size"])
             if col == 3:
                 return ("prüft " if st in ("verifying", "checking") else "") + f"{frac * 100:.1f} %".replace(".", ",")
             if col == 4:
+                move = r.get("action") == "move"
+                if kind == "delete":
+                    return {"pending": "wird gelöscht", "running": "löscht …",
+                            "done": "gelöscht (Papierkorb)"}.get(st, STATUS_TXT.get(st, st))
                 if st == "pending" and r.get("retry_at"):
                     wait = r["retry_at"] - time.time()
                     return f"Wiederholung in {int(wait) + 1} s" if wait > 0 else f"Versuch {r['tries'] + 1} wartet"
                 if st == "pending" and r["offset"]:
                     return "pausiert"
+                if st == "pending":
+                    return ("als Nächstes" if r.get("prio") else "wartend") + (" (verschieben)" if move else "")
+                if st == "done" and move:
+                    return "verschoben, geprüft" if r.get("hash") else "verschoben"
                 if st == "done" and (r.get("hash") or r.get("checked")):
                     return "geprüft"
                 if st == "skipped" and r.get("hash"):
@@ -137,6 +149,10 @@ class JobModel(QtCore.QAbstractTableModel):
         elif role == Qt.ItemDataRole.ForegroundRole and col == 4:
             if st == "pending" and r.get("retry_at"):
                 return QtGui.QBrush(QtGui.QColor("#d08a1c"))
+            if kind == "delete" and st in ("pending", "running"):
+                return QtGui.QBrush(QtGui.QColor("#c0392b"))
+            if st == "pending" and r.get("prio"):
+                return QtGui.QBrush(QtGui.QColor("#8e44ad"))
             return QtGui.QBrush(QtGui.QColor({"done": "#2e9e44", "failed": "#d0342c", "running": "#2a7ad5", "skipped": "#2e9e44",
                                               "written": "#2a7ad5", "verifying": "#2a7ad5",
                                               "checking": "#2a7ad5", "check_wait": "#2a7ad5"}
@@ -144,6 +160,8 @@ class JobModel(QtCore.QAbstractTableModel):
         elif role == Qt.ItemDataRole.TextAlignmentRole and col in (2, 5, 6):
             return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         elif role == Qt.ItemDataRole.DecorationRole and col == 0:
+            if r.get("kind") == "delete":
+                return QtGui.QIcon.fromTheme("edit-delete")
             if r.get("kind") in ("dir", "link") and st in FINISHED + ("pending",):
                 return QtGui.QIcon.fromTheme("folder" if r["kind"] == "dir" else "emblem-symbolic-link")
             return QtGui.QIcon.fromTheme({"done": "dialog-ok-apply", "failed": "dialog-error", "skipped": "go-jump", "written": "document-save",
