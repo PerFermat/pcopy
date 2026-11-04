@@ -59,8 +59,9 @@ def check(db):
     mounts = _mounts()
     targets, by_dev, affected = {}, {}, {}
     too_big, bad_name = [], []
-    rows = db.execute("SELECT id,src,dst,root,size,offset FROM jobs WHERE status='pending'").fetchall()
-    for jid, src, dst, root, size, offset in rows:
+    links = []
+    rows = db.execute("SELECT id,src,dst,root,size,offset,kind FROM jobs WHERE status='pending'").fetchall()
+    for jid, src, dst, root, size, offset, kind in rows:
         root = root or guess_root(src, dst)
         t = targets.get(root)
         if t is None:
@@ -70,6 +71,10 @@ def check(db):
                 continue
             t = by_dev.setdefault(t.dev, t)
             targets[root] = t
+        if kind == "link" and t.fstype in NO_SPECIAL:
+            affected[jid] = f"{t.fstype} kann keine symbolischen Links speichern ({t.mount})"
+            links.append(os.path.basename(dst))
+            continue
         if t.fstype in FAT and size >= FAT_MAX:
             affected[jid] = f"Größer als 4 GB – passt nicht auf FAT32 ({t.mount})"
             too_big.append(os.path.basename(dst))
@@ -90,6 +95,9 @@ def check(db):
     if too_big:
         msgs.append(f"<b>{len(too_big)} Dateien sind größer als 4 GB</b> und passen nicht auf FAT32: "
                     + _examples(too_big))
+    if links:
+        msgs.append(f"<b>{len(links)} symbolische Links</b> lassen sich auf FAT32/exFAT nicht anlegen: "
+                    + _examples(links))
     if bad_name:
         msgs.append(f"<b>{len(bad_name)} Datei- oder Ordnernamen</b> enthalten Zeichen, die das Ziel nicht "
                     "erlaubt (&lt; &gt; : \" \\ | ? *): " + _examples(bad_name))

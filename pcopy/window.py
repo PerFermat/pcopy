@@ -266,7 +266,7 @@ class MainWindow(AddMixin, ListMixin, MenuMixin, FontMixin, QtWidgets.QMainWindo
 
         # Alles erledigt: anhalten. Später hinzugefügte Dateien warten dann auf „Start“.
         if self.engine.is_running() and not open_jobs and not self.engine.active \
-                and not self.scans and not self.engine.unsynced():
+                and not self.scans and not self.engine.unsynced() and not self.engine.dirs_pending():
             self.engine.pause()
             self.status.showMessage(f"Fertig – {n_done} Dateien" + (f", {n_fail} mit Fehler" if n_fail else "")
                                     + ". Neue Dateien werden erst nach „Start“ kopiert. Bericht: Strg+B", 15000)

@@ -34,8 +34,8 @@ class JobModel(QtCore.QAbstractTableModel):
     def load(self, c):
         self.beginResetModel()
         self.rows = [dict(id=r[0], src=r[1], dst=r[2], size=r[3] or 0, offset=r[4] or 0, status=r[5], error=r[6],
-                          speed=r[7], hash=r[8], tries=r[9] or 0, retry_at=r[10])
-                     for r in c.execute("SELECT id,src,dst,size,offset,status,error,speed,hash,tries,retry_at "
+                          speed=r[7], hash=r[8], tries=r[9] or 0, retry_at=r[10], kind=r[11] or "file")
+                     for r in c.execute("SELECT id,src,dst,size,offset,status,error,speed,hash,tries,retry_at,kind "
                                         "FROM jobs ORDER BY id")]
         self.idx = {r["id"]: i for i, r in enumerate(self.rows)}
         self.live.clear()
@@ -100,9 +100,10 @@ class JobModel(QtCore.QAbstractTableModel):
         if st in ("verifying", "checking") and verified is not None and r["size"]:
             frac = verified / r["size"]              # Balken zeigt den Fortschritt des Prüfens
         if role == Qt.ItemDataRole.DisplayRole:
-            if col == 0: return os.path.basename(r["src"])
+            kind = r.get("kind", "file")
+            if col == 0: return os.path.basename(r["src"]) + ("/" if kind == "dir" else "")
             if col == 1: return os.path.dirname(r["dst"])
-            if col == 2: return hsize(r["size"])
+            if col == 2: return {"dir": "Ordner (leer)", "link": "Link"}.get(kind) or hsize(r["size"])
             if col == 3:
                 return ("prüft " if st in ("verifying", "checking") else "") + f"{frac * 100:.1f} %".replace(".", ",")
             if col == 4:
@@ -111,7 +112,7 @@ class JobModel(QtCore.QAbstractTableModel):
                     return f"Wiederholung in {int(wait) + 1} s" if wait > 0 else f"Versuch {r['tries'] + 1} wartet"
                 if st == "pending" and r["offset"]:
                     return "pausiert"
-                if st == "done" and r.get("hash"):
+                if st == "done" and (r.get("hash") or r.get("checked")):
                     return "geprüft"
                 if st == "skipped" and r.get("hash"):
                     return "übersprungen, geprüft"
@@ -125,6 +126,11 @@ class JobModel(QtCore.QAbstractTableModel):
             return frac
         elif role == Qt.ItemDataRole.ToolTipRole:
             t = f"Quelle: {r['src']}\nZiel:   {r['dst']}"
+            if r.get("kind") == "link":
+                try:
+                    t += f"\nLink auf: {os.readlink(r['src'])}"
+                except OSError:
+                    pass
             if r.get("hash") and st in FINISHED:
                 t += f"\nSHA-256: {r['hash']}\n(nach dem Kopieren von der Platte gelesen und verglichen)"
             return t + (f"\nFehler: {r['error']}" if r.get("error") else "")
@@ -138,6 +144,8 @@ class JobModel(QtCore.QAbstractTableModel):
         elif role == Qt.ItemDataRole.TextAlignmentRole and col in (2, 5, 6):
             return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         elif role == Qt.ItemDataRole.DecorationRole and col == 0:
+            if r.get("kind") in ("dir", "link") and st in FINISHED + ("pending",):
+                return QtGui.QIcon.fromTheme("folder" if r["kind"] == "dir" else "emblem-symbolic-link")
             return QtGui.QIcon.fromTheme({"done": "dialog-ok-apply", "failed": "dialog-error", "skipped": "go-jump", "written": "document-save",
                                           "running": "go-next", "verifying": "document-preview",
                                           "checking": "document-preview", "check_wait": "document-preview"}.get(st, "text-x-generic"))

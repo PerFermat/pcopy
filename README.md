@@ -24,8 +24,12 @@ Pause, Absturz oder abgezogener Platte exakt an der richtigen Stelle weitergehen
   `.NAME.pcopy-part`; erst wenn sie vollständig, gesichert und geprüft ist, wird sie in einem
   Schritt umbenannt. Eine Zieldatei, die ersetzt wird, bleibt bis dahin unverändert.
 - **Prüfung vor dem Start:** freier Platz je Ziel-Laufwerk, Dateien ab 4 GB auf FAT32 und
-  Zeichen, die FAT32/exFAT in Namen nicht erlauben (`< > : " \ | ? *`). Betroffene Dateien
+  Zeichen, die FAT32/exFAT in Namen nicht erlauben (`< > : " \ | ? *`) sowie symbolische Links,
+  die FAT32/exFAT nicht speichern können. Betroffene Dateien
   lassen sich überspringen, der Rest wird kopiert.
+- **Vollständige Ordner:** leere Ordner werden mitkopiert, symbolische Links als Links (auch
+  Links auf Ordner und Links ins Leere), und am Ende übernimmt pcopy Zeitstempel und Rechte der
+  Ordner – von innen nach außen, damit das Anlegen der Dateien sie nicht wieder verändert.
 - **Automatisch wiederholen:** Bei vorübergehenden Fehlern (E/A-Fehler, Gerät kurz weg,
   Zeitüberschreitung, fehlgeschlagene Prüfung) bis zu 3 weitere Versuche nach 10, 30 und 60 s –
   ab dem zuletzt gesicherten Stand. Dauerhafte Fehler (Datei fehlt, keine Berechtigung, Platte

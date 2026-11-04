@@ -28,6 +28,8 @@ def db_connect(path=DB_PATH):
     if "hash" not in cols:
         c.execute("ALTER TABLE jobs ADD COLUMN hash TEXT")      # SHA-256, wenn nach dem Kopieren geprüft
         _adopt_partials(c)                                      # einmalig beim Umstieg auf Hilfsdateien
+    if "kind" not in cols:
+        c.execute("ALTER TABLE jobs ADD COLUMN kind TEXT DEFAULT 'file'")  # file, dir (leerer Ordner), link
     if "tries" not in cols:
         c.execute("ALTER TABLE jobs ADD COLUMN tries INTEGER DEFAULT 0")   # automatische Wiederholungen
         c.execute("ALTER TABLE jobs ADD COLUMN retry_at REAL")             # frühester neuer Versuch (Unix-Zeit)

@@ -27,7 +27,8 @@ class Checker:
     def add(self, rows):
         """rows: Zeilen-Dicts aus dem Tabellenmodell (status done/skipped)."""
         for r in rows:
-            self.q.put((self.gen, r["id"], r["src"], r["dst"], r["size"], r.get("hash"), r["status"]))
+            self.q.put((self.gen, r["id"], r["src"], r["dst"], r["size"], r.get("hash"), r["status"],
+                        r.get("kind", "file")))
             self.engine.events.put((r["id"], {"status": "check_wait"}))
 
     def stop(self):
@@ -66,7 +67,7 @@ class Checker:
         c = db_connect()
         ev = self.engine.events
         while True:
-            gen, jid, src, dst, size, digest, old = self.q.get()
+            gen, jid, src, dst, size, digest, old, kind = self.q.get()
             if gen != self.gen:
                 ev.put((jid, {"status": old}))
                 continue
@@ -77,6 +78,20 @@ class Checker:
             self.current = act
             ev.put((jid, {"status": "checking"}))
             try:
+                if kind in ("dir", "link"):
+                    if kind == "dir":
+                        ok, msg = os.path.isdir(dst), "Prüfung: Ordner fehlt"
+                    else:
+                        ok = os.path.islink(dst) and os.readlink(dst) == os.readlink(src)
+                        msg = "Prüfung: Link fehlt oder zeigt woandershin"
+                    if ok:
+                        self.ok += 1
+                        ev.put((jid, {"status": old, "checked": True, "error": None}))
+                    else:
+                        self.bad += 1
+                        c.execute("UPDATE jobs SET status='failed', error=? WHERE id=?", (msg, jid))
+                        ev.put((jid, {"status": "failed", "error": msg}))
+                    continue
                 if not os.path.exists(dst):
                     ok, msg = False, "Prüfung: Zieldatei fehlt"
                 else:

@@ -21,7 +21,7 @@ import threading
 import time
 from collections import deque
 
-from .db import db_connect
+from .db import db_connect, guess_root
 
 CHUNK = 1024 * 1024
 SYNC_EVERY = 2.0          # s: Stand großer Dateien sichern / kleine Dateien gesammelt syncen
@@ -156,6 +156,9 @@ class Engine:
         self.written_since = None
         self.wlock = threading.Lock()
         self.sync_lock = threading.Lock()
+        self.touched = {}         # Zielordner -> Quellordner, deren Zeitstempel am Ende gesetzt werden
+        self.tlock = threading.Lock()
+        self.stamping = False
         threading.Thread(target=self._syncer, daemon=True).start()
 
     def alive(self):
@@ -202,7 +205,7 @@ class Engine:
             t.join(max(0.0, end - time.monotonic()))
         # noch nicht gesicherte kleine Dateien sichern; hängt das Ziel, bleiben sie „written“
         # und werden beim nächsten Start neu kopiert
-        f = threading.Thread(target=self.flush, daemon=True)
+        f = threading.Thread(target=lambda: (self.flush(), self._stamp_dirs(db_connect())), daemon=True)
         f.start()
         f.join(max(2.0, end - time.monotonic()))
         return not any(t.is_alive() for t in threads) and not f.is_alive()
@@ -307,7 +310,7 @@ class Engine:
 
     def _claim(self, c):
         with self.claim_lock:
-            row = c.execute("SELECT id,src,dst,size,mtime,offset FROM jobs WHERE status='pending' "
+            row = c.execute("SELECT id,src,dst,size,mtime,offset,kind,root FROM jobs WHERE status='pending' "
                             "AND (retry_at IS NULL OR retry_at <= ?) ORDER BY id LIMIT 1", (time.time(),)).fetchone()
             if row:
                 c.execute("UPDATE jobs SET status='running' WHERE id=?", (row[0],))
@@ -318,15 +321,23 @@ class Engine:
         while not stop.is_set() and nr < self.n:
             job = self._claim(c)
             if not job:
+                if nr == 0:
+                    self._stamp_dirs(c)
                 stop.wait(0.5)
                 continue
-            jid, src, dst, size, mtime, offset = job
+            jid, src, dst, size, mtime, offset, kind, root = job
             act = Active(jid, src, dst, size)
             self.active[jid] = act
             self.events.put((jid, {"status": "running"}))
             try:
-                result, digest = self._copy(c, act, mtime, offset, stop)
+                if kind == "dir":
+                    result, digest = self._mkdir(c, act)
+                elif kind == "link":
+                    result, digest = self._link(c, act)
+                else:
+                    result, digest = self._copy(c, act, mtime, offset, stop)
                 if result:
+                    self._touch(src, dst, root or guess_root(src, dst), kind)
                     self.events.put((jid, {"status": result, "offset": act.size, "size": act.size, "error": None,
                                            "speed": act.avg, "hash": digest, "retry_at": None,
                                            **({"tries": 0} if result == "done" else {})}))
@@ -343,6 +354,67 @@ class Engine:
                 with self.flock:
                     self.finished_bytes += act.copied - act.base
                     self.active.pop(jid, None)
+
+    # ---------------------------------------------------------------- Ordner und Links
+    def _touch(self, src, dst, root, kind):
+        """Ordner unterhalb des Zielordners merken, deren Zeitstempel am Ende übernommen werden."""
+        root = os.path.normpath(root)
+        sd, dd = (src, dst) if kind == "dir" else (os.path.dirname(src), os.path.dirname(dst))
+        with self.tlock:
+            while os.path.normpath(dd) != root and dd.startswith(root + os.sep):
+                if dd in self.touched:
+                    break                          # Rest der Kette ist schon gemerkt
+                self.touched[dd] = sd
+                sd, dd = os.path.dirname(sd), os.path.dirname(dd)
+
+    def dirs_pending(self):
+        return self.stamping or bool(self.touched)
+
+    def _stamp_dirs(self, c):
+        """Ist alles kopiert und gesichert, Zeitstempel und Rechte der Ordner übernehmen – von innen
+        nach außen, denn jede neue Datei hätte den Zeitstempel ihres Ordners wieder verändert."""
+        if not self.touched or self.active or self.unsynced() or \
+                c.execute("SELECT 1 FROM jobs WHERE status IN ('pending','running','written') LIMIT 1").fetchone():
+            return
+        self.stamping = True
+        try:
+            with self.tlock:
+                pairs, self.touched = self.touched, {}
+            for dd in sorted(pairs, key=lambda p: p.count(os.sep), reverse=True):
+                try:
+                    shutil.copystat(pairs[dd], dd)
+                except OSError:
+                    pass                           # z. B. FAT: keine Rechte – Zeiten sind dann trotzdem gesetzt
+        finally:
+            self.stamping = False
+
+    def _mkdir(self, c, act):
+        """Leerer Ordner."""
+        os.makedirs(act.dst, exist_ok=True)
+        c.execute("UPDATE jobs SET status='done', error=NULL, tries=0, retry_at=NULL WHERE id=?", (act.id,))
+        return "done", None
+
+    def _link(self, c, act):
+        """Symbolischen Link als Link anlegen: erst unter Hilfsnamen, dann umbenennen (ersetzt atomar)."""
+        target = os.readlink(act.src)
+        d = os.path.dirname(act.dst)
+        os.makedirs(d, exist_ok=True)
+        tmp = part_path(act.dst, act.id)
+        if os.path.lexists(tmp):
+            os.remove(tmp)
+        os.symlink(target, tmp)
+        st = os.lstat(act.src)
+        try:
+            os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns), follow_symlinks=False)
+        except (OSError, NotImplementedError):
+            pass
+        if self.verify and os.readlink(tmp) != target:
+            os.remove(tmp)
+            raise VerifyError("Prüfung fehlgeschlagen: Linkziel weicht ab")
+        os.replace(tmp, act.dst)
+        fsync_dir(d)
+        c.execute("UPDATE jobs SET status='done', error=NULL, hash=NULL, tries=0, retry_at=NULL WHERE id=?", (act.id,))
+        return "done", None
 
     def _fail(self, c, jid, msg, retry, restart=False):
         """Fehler verbuchen. Vorübergehende Fehler: bis zu len(RETRY_DELAYS)-mal später erneut."""

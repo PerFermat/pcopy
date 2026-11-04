@@ -22,21 +22,30 @@ def keep_existing(mode, st, ds):
 
 
 def collect(paths, dest):
-    """(quelle, ziel)-Paare; Ordner werden rekursiv mit ihrer Struktur übernommen."""
+    """(quelle, ziel, art)-Tripel; Ordner werden rekursiv mit ihrer Struktur übernommen.
+    art: „file“, „link“ (symbolischer Link – wird als Link kopiert, auch auf Ordner oder ins Leere)
+    oder „dir“ (leerer Ordner – Ordner mit Inhalt entstehen beim Kopieren ohnehin)."""
     dest = Path(dest)
     for s in paths:
         sp = Path(s).absolute()
         if sp.is_dir():
             for root, dirs, files in os.walk(sp):
-                dirs.sort()
-                for f in sorted(files):
-                    if is_part(f):                   # angefangene Hilfsdatei einer früheren Kopie
-                        continue
-                    fp = Path(root) / f
-                    if fp.is_file():
-                        yield fp, dest / sp.name / fp.relative_to(sp)
+                rp = Path(root)
+                links = [d for d in dirs if (rp / d).is_symlink()]   # os.walk folgt ihnen nicht
+                dirs[:] = sorted(d for d in dirs if d not in links)
+                names = sorted(f for f in files + links if not is_part(f))
+                if not dirs and not names:
+                    yield rp, dest / sp.name / rp.relative_to(sp), "dir"
+                for f in names:
+                    fp = rp / f
+                    if fp.is_symlink():
+                        yield fp, dest / sp.name / fp.relative_to(sp), "link"
+                    elif fp.is_file():
+                        yield fp, dest / sp.name / fp.relative_to(sp), "file"
         elif sp.is_file():
-            yield sp, dest / sp.name
+            yield sp, dest / sp.name, "file"
+        elif sp.is_symlink():                                       # Link ins Leere
+            yield sp, dest / sp.name, "link"
 
 
 class Scanner:
@@ -89,16 +98,18 @@ class Scanner:
             nonlocal found, last
             rows = []
             c.execute("BEGIN")
-            for sp, dp, st, status, off in found:
-                cur = c.execute("INSERT OR IGNORE INTO jobs(src,dst,size,mtime,offset,status,added,root) "
-                                "VALUES(?,?,?,?,?,?,?,?)",
-                                (sp, dp, st.st_size, st.st_mtime, off, status, now, str(target)))
+            for sp, dp, st, status, off, kind in found:
+                size = st.st_size if kind == "file" else 0
+                cur = c.execute("INSERT OR IGNORE INTO jobs(src,dst,size,mtime,offset,status,added,root,kind) "
+                                "VALUES(?,?,?,?,?,?,?,?,?)",
+                                (sp, dp, size, st.st_mtime, off if kind == "file" else 0, status, now,
+                                 str(target), kind))
                 if cur.rowcount:
-                    rows.append(dict(id=cur.lastrowid, src=sp, dst=dp, size=st.st_size,
-                                     offset=off, status=status, error=None))
+                    rows.append(dict(id=cur.lastrowid, src=sp, dst=dp, size=size, kind=kind,
+                                     offset=off if kind == "file" else 0, status=status, error=None))
                     stats["new"] += 1
                     if status == "pending":
-                        stats["total"] += st.st_size
+                        stats["total"] += size
                     else:
                         stats["skipped"] += 1
                 else:
@@ -107,22 +118,22 @@ class Scanner:
             c.execute("COMMIT")
             found, last = [], time.monotonic()
 
-        for sp, dp in collect(paths, target):
+        for sp, dp, kind in collect(paths, target):
             if gen != self.gen:
                 return                           # verworfen: noch nicht Eingetragenes fallen lassen
             stats["seen"] += 1
             try:
-                st = sp.stat()
+                st = sp.lstat() if kind == "link" else sp.stat()
             except OSError:
                 continue
             status, off = "pending", 0
             try:
-                ds = dp.stat()
+                ds = dp.lstat()
             except OSError:
                 ds = None
-            if ds is not None and keep_existing(mode, st, ds):
+            if ds is not None and (kind == "dir" or keep_existing(mode, st, ds)):
                 status, off = "skipped", st.st_size
-            found.append((str(sp), str(dp), st, status, off))
+            found.append((str(sp), str(dp), st, status, off, kind))
             if len(found) >= self.BATCH or time.monotonic() - last >= self.EVERY:
                 flush()
         flush()
