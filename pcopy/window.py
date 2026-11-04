@@ -1,4 +1,5 @@
 """Hauptfenster: Aufbau, Start/Pause, laufende Aktualisierung, Beenden."""
+import os
 import queue
 import time
 from collections import deque
@@ -98,6 +99,8 @@ class MainWindow(AddMixin, ListMixin, MenuMixin, FontMixin, QtWidgets.QMainWindo
         self.spin = QtWidgets.QSpinBox(minimum=1, maximum=16)
         self.spin.setValue(int(self.settings.value("parallel", 4)))
         self.spin.valueChanged.connect(self.engine.set_parallel)
+        self.spin.setToolTip("Wie viele Dateien gleichzeitig kopiert werden.\n"
+                             "Auf drehenden Festplatten höchstens eine (Einstellungen → Festplatten nacheinander).")
         tb.addWidget(self.spin)
         tb.addWidget(QtWidgets.QLabel("  Max. Tempo: "))
         self.limit = QtWidgets.QSpinBox(minimum=0, maximum=10000, singleStep=5, suffix=" MB/s")
@@ -180,10 +183,26 @@ class MainWindow(AddMixin, ListMixin, MenuMixin, FontMixin, QtWidgets.QMainWindo
         if not self.engine.is_running() and not self.check_targets():
             return
         self.engine.verify = self.verify.isChecked()
+        self.engine.hdd_serial = self.hdd_serial.isChecked()
+        self.engine.gentle = self.gentle.isChecked()
         if not self.engine.is_running():
+            self.hint_hdds()
             self.fails_at_start = sum(r["status"] == "failed" for r in self.model.rows)
         self.engine.start(self.spin.value())
         self.tick()
+
+    def hint_hdds(self):
+        """Beim Start sagen, wenn ein Ziel eine Festplatte ist und deshalb nacheinander kopiert wird."""
+        if not self.hdd_serial.isChecked() or self.spin.value() < 2:
+            return
+        names = []
+        for (root,) in self.db.execute("SELECT DISTINCT root FROM jobs WHERE status='pending' AND root IS NOT NULL"):
+            rot, name = self.engine.devices.describe(self.engine.devices.dev(os.path.join(root, "x")))
+            if rot and name not in names:
+                names.append(name)
+        if names:
+            self.status.showMessage(f"Festplatte als Ziel: {', '.join(names)} – dort wird jeweils nur eine Datei "
+                                    "kopiert (Einstellungen → Festplatten nacheinander)", 15000)
 
     def show_report(self):
         if self.report is None:
@@ -369,5 +388,7 @@ class MainWindow(AddMixin, ListMixin, MenuMixin, FontMixin, QtWidgets.QMainWindo
         self.settings.setValue("existing", self.existing.currentData())
         self.settings.setValue("follow", "true" if self.follow.isChecked() else "false")
         self.settings.setValue("verify", "true" if self.verify.isChecked() else "false")
+        self.settings.setValue("hdd_serial", "true" if self.hdd_serial.isChecked() else "false")
+        self.settings.setValue("gentle", "true" if self.gentle.isChecked() else "false")
         self.settings.setValue("target", self.target.text())
         e.accept()

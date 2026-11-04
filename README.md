@@ -45,6 +45,12 @@ Pause, Absturz oder abgezogener Platte exakt an der richtigen Stelle weitergehen
   nächsten Start automatisch neu kopiert.
 - **Kopiert erst nach „Start“** – auch beim Aufruf aus Dolphin. Ist alles fertig, hält pcopy an;
   neu hinzugefügte Dateien warten wieder auf „Start“.
+- **Festplatten nacheinander:** Drehende Festplatten (Quelle oder Ziel) werden nur von einer Kopie
+  zur Zeit benutzt – sonst springt der Lesekopf und alles wird langsamer. SSDs nutzen weiter die
+  eingestellte Zahl gleichzeitiger Kopien. Abschaltbar unter Einstellungen.
+- **Rücksicht auf andere Programme:** Plattenzugriffe mit niedrigster Priorität (`ionice idle`),
+  Prüfsummen mit niedriger CPU-Priorität, und kopierte Daten werden aus dem Seiten-Cache
+  entfernt, damit große Kopien den Speicher der anderen Programme nicht verdrängen.
 - **Tempo-Begrenzung** (MB/s, gesamt), damit der Rechner nebenher flüssig bleibt.
 - **Vorhandene Zieldateien:** überspringen, überschreiben oder nur durch neuere ersetzen.
 - **Ziel pro Datei:** Ein neuer Zielordner gilt für danach hinzugefügte Dateien; per Rechtsklick
@@ -98,6 +104,7 @@ Die Job-Liste liegt als SQLite-Datenbank `pcopy.db` **neben dem Programm**. Eins
 | `pcopy/precheck.py` | Prüfung vor dem Start (Platz, FAT32-Grenzen) |
 | `pcopy/checker.py` | Nachträgliches Prüfen fertiger Dateien |
 | `pcopy/report.py` | Bericht (Anzeige, Text, CSV) |
+| `pcopy/devices.py` | Festplatte oder SSD erkennen, Priorität, Seiten-Cache |
 | `pcopy/scanner.py` | Einlesen im Hintergrund, Regeln für vorhandene Dateien |
 | `pcopy/model.py` | Tabellenmodell und Fortschrittsbalken |
 | `pcopy/db.py` | Datenbank |

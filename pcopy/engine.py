@@ -22,6 +22,7 @@ import time
 from collections import deque
 
 from .db import db_connect, guess_root
+from .devices import Devices, drop_cache, lower_priority
 
 CHUNK = 1024 * 1024
 SYNC_EVERY = 2.0          # s: Stand großer Dateien sichern / kleine Dateien gesammelt syncen
@@ -151,6 +152,10 @@ class Engine:
         self.events = queue.Queue()
         self.throttle = Throttle()
         self.verify = True        # nach dem Kopieren von der Platte zurücklesen und vergleichen
+        self.hdd_serial = True    # je drehender Festplatte (Quelle oder Ziel) nur eine Kopie gleichzeitig
+        self.gentle = True        # niedrige Platten-/CPU-Priorität, Seiten-Cache schonen
+        self.devices = Devices()
+        self.dev_busy = {}        # st_dev -> laufende Kopien auf dieser Festplatte
         self.n = 4
         self.written = []         # kleine Dateien, die noch gesynct/geprüft/umbenannt werden müssen
         self.written_since = None
@@ -235,6 +240,8 @@ class Engine:
                 done += len(buf)
                 if act is not None:
                     act.verified = done
+            if self.gentle:
+                drop_cache(f.fileno())
         return h.hexdigest() == digest
 
     # ---------------------------------------------------------------- gesammeltes Sichern
@@ -243,6 +250,7 @@ class Engine:
             return len(self.written)
 
     def _syncer(self):
+        lower_priority()
         c = db_connect()
         while True:
             time.sleep(0.25)
@@ -275,6 +283,9 @@ class Engine:
                 self._sync_dirs(p for _, p, _, _ in batch)           # Daten sicher auf der Platte
                 for jid, part, dst, digest in batch:
                     try:
+                        if self.gentle and digest is None:
+                            with open(part, "rb") as f:
+                                drop_cache(f.fileno())
                         if digest is not None and not self._verify(part, digest):
                             bad.append((jid, part, "Prüfung fehlgeschlagen: Ziel weicht von der Quelle ab", True))
                             continue
@@ -308,15 +319,37 @@ class Engine:
         with self.flock:
             return self.finished_bytes + sum(a.copied - a.base for a in list(self.active.values()))
 
+    def _hdds(self, src, dst):
+        """Drehende Festplatten, die diese Kopie belegt (Quelle und/oder Ziel)."""
+        if not self.hdd_serial:
+            return set()
+        devs = {self.devices.dev(src), self.devices.dev(dst)}
+        return {d for d in devs if self.devices.describe(d)[0]}
+
     def _claim(self, c):
+        """Nächste wartende Datei übernehmen – aber keine, deren Festplatte schon beschäftigt ist:
+        mehrere Kopien gleichzeitig lassen den Lesekopf springen und machen alles langsamer."""
         with self.claim_lock:
-            row = c.execute("SELECT id,src,dst,size,mtime,offset,kind,root FROM jobs WHERE status='pending' "
-                            "AND (retry_at IS NULL OR retry_at <= ?) ORDER BY id LIMIT 1", (time.time(),)).fetchone()
-            if row:
+            rows = c.execute("SELECT id,src,dst,size,mtime,offset,kind,root FROM jobs WHERE status='pending' "
+                             "AND (retry_at IS NULL OR retry_at <= ?) ORDER BY id LIMIT 64", (time.time(),)).fetchall()
+            for row in rows:
+                hdds = self._hdds(row[1], row[2])
+                if any(self.dev_busy.get(d, 0) >= 1 for d in hdds):
+                    continue
+                for d in hdds:
+                    self.dev_busy[d] = self.dev_busy.get(d, 0) + 1
                 c.execute("UPDATE jobs SET status='running' WHERE id=?", (row[0],))
-            return row
+                return row + (hdds,)
+            return None
+
+    def _release(self, hdds):
+        with self.claim_lock:
+            for d in hdds:
+                self.dev_busy[d] = max(0, self.dev_busy.get(d, 0) - 1)
 
     def _worker(self, nr, stop):
+        if self.gentle:
+            lower_priority()
         c = db_connect()
         while not stop.is_set() and nr < self.n:
             job = self._claim(c)
@@ -325,7 +358,7 @@ class Engine:
                     self._stamp_dirs(c)
                 stop.wait(0.5)
                 continue
-            jid, src, dst, size, mtime, offset, kind, root = job
+            jid, src, dst, size, mtime, offset, kind, root, hdds = job
             act = Active(jid, src, dst, size)
             self.active[jid] = act
             self.events.put((jid, {"status": "running"}))
@@ -351,6 +384,7 @@ class Engine:
             except Exception as e:
                 self._fail(c, jid, str(e), retry=False)
             finally:
+                self._release(hdds)
                 with self.flock:
                     self.finished_bytes += act.copied - act.base
                     self.active.pop(jid, None)
@@ -467,6 +501,12 @@ class Engine:
                     h.update(fs.read(min(CHUNK, offset - fs.tell())))
             fs.seek(offset)
             fd.seek(offset)
+            gentle = self.gentle
+            if gentle:
+                try:
+                    os.posix_fadvise(fs.fileno(), 0, 0, os.POSIX_FADV_SEQUENTIAL)
+                except (AttributeError, OSError):
+                    pass
             t0 = last = time.monotonic()
             act.samples.append((last, offset))   # Startpunkt: Tempo schon nach dem ersten Block
             while True:
@@ -487,16 +527,22 @@ class Engine:
                 fd.write(buf)
                 if h is not None:
                     h.update(buf)
+                if gentle:
+                    drop_cache(fs.fileno(), act.copied, len(buf))   # Quelle: gelesen = nicht mehr nötig
                 act.copied += len(buf)
                 now = time.monotonic()
                 act.samples.append((now, act.copied))
                 if now - last >= SYNC_EVERY:
                     fd.flush(); os.fsync(fd.fileno())
+                    if gentle:
+                        drop_cache(fd.fileno())                  # Ziel: gesichert = aus dem Cache
                     c.execute("UPDATE jobs SET offset=? WHERE id=?", (act.copied, act.id))
                     last = now
             fd.flush()
             if not small:
                 os.fsync(fd.fileno())
+                if gentle:
+                    drop_cache(fd.fileno())
                 # alles sicher auf der Platte: Stand sichern, damit ein späterer Fehler (Prüfen,
                 # Umbenennen …) beim nächsten Versuch nicht wieder alles kopieren muss
                 c.execute("UPDATE jobs SET offset=? WHERE id=?", (act.copied, act.id))

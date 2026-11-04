@@ -59,6 +59,20 @@ class MenuMixin:
                                  "vergleichen – erst dann bekommt sie ihren richtigen Namen")
         self.verify.setChecked(self.settings.value("verify", "true") == "true")
         self.verify.toggled.connect(lambda on: setattr(self.engine, "verify", on))
+        self.hdd_serial = m.addAction("Festplatten nacheinander (je Festplatte 1 Datei gleichzeitig)")
+        self.hdd_serial.setCheckable(True)
+        self.hdd_serial.setStatusTip("Drehende Festplatten (Quelle oder Ziel) werden nur von einer Kopie zur Zeit "
+                                     "benutzt – sonst springt der Lesekopf und alles wird langsamer. SSDs nutzen "
+                                     "weiter „Gleichzeitig“.")
+        self.hdd_serial.setChecked(self.settings.value("hdd_serial", "true") == "true")
+        self.hdd_serial.toggled.connect(lambda on: setattr(self.engine, "hdd_serial", on))
+        self.gentle = m.addAction("Rücksicht auf andere Programme (niedrige Priorität, Cache schonen)")
+        self.gentle.setCheckable(True)
+        self.gentle.setStatusTip("Plattenzugriffe mit niedrigster Priorität, Prüfsummen mit niedriger CPU-Priorität; "
+                                 "kopierte Daten werden aus dem Seiten-Cache entfernt")
+        self.gentle.setChecked(self.settings.value("gentle", "true") == "true")
+        self.gentle.toggled.connect(lambda on: setattr(self.engine, "gentle", on))
+        m.addSeparator()
         self.follow = m.addAction("Liste mitlaufen lassen")
         self.follow.setCheckable(True)
         self.follow.setStatusTip("Liste so verschieben, dass die gerade kopierten Dateien in der Mitte stehen")

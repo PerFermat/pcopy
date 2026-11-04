@@ -9,6 +9,7 @@ import queue
 import threading
 
 from .db import db_connect
+from .devices import drop_cache, lower_priority
 from .engine import Active
 
 CHUNK = 1024 * 1024
@@ -39,16 +40,13 @@ class Checker:
     def busy(self):
         return self.current is not None or not self.q.empty()
 
-    def _hash(self, path, act, base, drop_cache):
+    def _hash(self, path, act, base, uncached):
         h = hashlib.sha256()
         never = threading.Event()
         th = self.engine.throttle
         with open(path, "rb") as f:
-            if drop_cache:
-                try:
-                    os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
-                except (AttributeError, OSError):
-                    pass
+            if uncached:
+                drop_cache(f.fileno())                # vom Datenträger lesen, nicht aus dem Cache
             done = 0
             while True:
                 if self.cancel.is_set():
@@ -58,12 +56,15 @@ class Checker:
                 buf = f.read(size)
                 th.refund(size - len(buf))
                 if not buf:
+                    if self.engine.gentle:
+                        drop_cache(f.fileno())
                     return h.hexdigest()
                 h.update(buf)
                 done += len(buf)
                 act.verified = base + done * act.scale
 
     def _run(self):
+        lower_priority()
         c = db_connect()
         ev = self.engine.events
         while True:
@@ -95,8 +96,8 @@ class Checker:
                 if not os.path.exists(dst):
                     ok, msg = False, "Prüfung: Zieldatei fehlt"
                 else:
-                    want = digest or self._hash(src, act, 0, drop_cache=False)
-                    got = want and self._hash(dst, act, size * (1 - act.scale), drop_cache=True)
+                    want = digest or self._hash(src, act, 0, uncached=False)
+                    got = want and self._hash(dst, act, size * (1 - act.scale), uncached=True)
                     if want is None or got is None:          # abgebrochen
                         ev.put((jid, {"status": old}))
                         continue
@@ -110,9 +111,9 @@ class Checker:
                     self.bad += 1
                     c.execute("UPDATE jobs SET status='failed', offset=0, error=? WHERE id=?", (msg, jid))
                     ev.put((jid, {"status": "failed", "offset": 0, "error": msg}))
-            except OSError as e:
+            except Exception as e:                       # der Prüf-Thread darf nie ausfallen
                 self.bad += 1
-                msg = f"Prüfung nicht möglich: {e.strerror or e}"
+                msg = f"Prüfung nicht möglich: {getattr(e, 'strerror', None) or e}"
                 c.execute("UPDATE jobs SET error=? WHERE id=?", (msg, jid))
                 ev.put((jid, {"status": old, "error": msg}))
             finally:
