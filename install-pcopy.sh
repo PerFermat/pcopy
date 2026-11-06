@@ -44,6 +44,8 @@ cat > ~/.local/share/kio/servicemenus/pcopy.desktop <<EOF
 [Desktop Entry]
 Type=Service
 MimeType=all/all;
+X-KDE-ServiceTypes=KonqPopupMenu/Plugin
+X-KDE-Protocols=file
 Actions=pcopy
 X-KDE-Priority=TopLevel
 
