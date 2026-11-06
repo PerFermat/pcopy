@@ -87,6 +87,10 @@ class AddMixin:
                 msg += f", {st['excluded']} ausgeschlossen"
             if st["skipped"]:
                 msg += f", {st['skipped']} übersprungen (im Ziel schon vorhanden)"
+            if st.get("renamed"):
+                msg += f", {st['renamed']} unter neuem Namen (im Ziel gab es den Namen schon)"
+            if st.get("conflict"):
+                msg += f", {st['conflict']} gibt es im Ziel schon – Entscheidung beim Start"
             if st["dup"]:
                 msg += f", {st['dup']} waren schon in der Liste"
             if st["error"]:
@@ -94,6 +98,8 @@ class AddMixin:
             elif not self.engine.is_running() and st["new"] > st["skipped"]:
                 msg += " – zum Kopieren „Start“ drücken"
             self.status.showMessage(msg, 10000)
+            if st.get("conflict") and self.engine.is_running():
+                self.decide_conflicts(start=False)     # läuft schon: gleich fragen, nicht erst beim nächsten Start
         if self.scans:
             seen = sum(v["seen"] for v in self.scans.values())
             self.scan_label.setText(f"Lese ein … {seen:,} Dateien gefunden".replace(",", "."))

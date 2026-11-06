@@ -10,18 +10,41 @@ from pathlib import Path
 from .db import db_connect
 from .engine import is_part
 
-EXISTING = [("skip", "überspringen"), ("overwrite", "überschreiben"), ("newer", "überschreiben, wenn neuer")]
+EXISTING = [("skip", "überspringen"), ("overwrite", "überschreiben"), ("newer", "überschreiben, wenn neuer"),
+            ("rename", "beide behalten (umbenennen)"), ("ask", "nachfragen")]
 ACTIONS = [("copy", "Kopieren"), ("move", "Verschieben"), ("mirror", "Spiegeln")]
 
 
-def keep_existing(mode, st, ds):
-    """True, wenn die vorhandene Zieldatei (ds) laut Einstellung bleiben soll.
+def same_file(st, ds):
+    """Gleiche Größe und Änderungszeit – dann gilt die Zieldatei als dieselbe.
     Toleranz 2 s, weil FAT-Datenträger Zeiten nur auf 2 s genau speichern."""
+    return st.st_size == ds.st_size and abs(st.st_mtime - ds.st_mtime) <= 2
+
+
+def resolve(mode, st, ds):
+    """Was mit einer Datei geschieht, deren Ziel (ds) es schon gibt: „skip“, „copy“ (überschreiben),
+    „rename“ (beide behalten) oder „ask“ (vor dem Start nachfragen). Bei „rename“ und „ask“ wird
+    eine offensichtlich gleiche Datei übersprungen – sonst gäbe jeder neue Lauf weitere Kopien."""
     if mode == "overwrite":
-        return False
+        return "copy"
     if mode == "newer":
-        return st.st_mtime <= ds.st_mtime + 2
-    return True
+        return "copy" if st.st_mtime > ds.st_mtime + 2 else "skip"
+    if mode in ("rename", "ask"):
+        return "skip" if same_file(st, ds) else mode
+    return "skip"
+
+
+def free_name(dst, taken):
+    """Freier Name „NAME (2).ENDUNG“, „NAME (3).ENDUNG“ … im selben Ordner.
+    taken(pfad): True, wenn der Name schon von einem anderen Eintrag der Liste belegt ist."""
+    d, name = os.path.split(dst)
+    stem, ext = os.path.splitext(name)
+    n = 2
+    while True:
+        cand = os.path.join(d, f"{stem} ({n}){ext}")
+        if not os.path.lexists(cand) and not taken(cand):
+            return cand
+        n += 1
 
 
 def parse_patterns(text):
@@ -132,7 +155,8 @@ class Scanner:
         while True:
             gen, rid, paths, target, mode = self.req.get()
             self.idle.clear()
-            stats = dict(new=0, skipped=0, dup=0, total=0, seen=0, error=None, excluded=0, delete=0)
+            stats = dict(new=0, skipped=0, dup=0, total=0, seen=0, error=None, excluded=0, delete=0, renamed=0,
+                         conflict=0)
             try:
                 if gen == self.gen:
                     self._scan(c, gen, rid, paths, target, mode, stats)
@@ -168,6 +192,8 @@ class Scanner:
                     stats["new"] += 1
                     if kind == "delete":
                         stats["delete"] += 1
+                    elif status == "conflict":
+                        stats["conflict"] += 1
                     elif status == "pending":
                         stats["total"] += size
                     else:
@@ -178,6 +204,12 @@ class Scanner:
             c.execute("COMMIT")
             found, last = [], time.monotonic()
 
+        reserved = set()                         # neue Namen aus „beide behalten“ in diesem Durchlauf
+        planned = set()                          # alle Ziele dieses Durchlaufs (noch nicht alle in der DB)
+
+        def taken(path):
+            return path in planned or c.execute("SELECT 1 FROM jobs WHERE dst=? LIMIT 1", (path,)).fetchone()
+
         counter = [0]
         for sp, dp, kind in collect(paths, target, pats, counter):
             if gen != self.gen:
@@ -187,14 +219,28 @@ class Scanner:
                 st = sp.lstat() if kind == "link" else sp.stat()
             except OSError:
                 continue
-            status, off = "pending", 0
+            status, off, dst = "pending", 0, str(dp)
             try:
                 ds = dp.lstat()
             except OSError:
                 ds = None
-            if ds is not None and (kind == "dir" or keep_existing(mode, st, ds)):
+            todo = "copy" if ds is None else "skip" if kind == "dir" else resolve(mode, st, ds)
+            if todo != "skip" and dst in reserved:
+                todo = "rename"                  # Name ist schon für eine umbenannte Datei vergeben
+            if todo in ("rename", "ask") and c.execute(
+                    "SELECT 1 FROM jobs WHERE src=? AND root=? LIMIT 1", (str(sp), str(target))).fetchone():
+                stats["dup"] += 1                # schon (umbenannt) in der Liste
+                continue
+            if todo == "skip":
                 status, off = "skipped", st.st_size
-            found.append((str(sp), str(dp), st, status, off, kind))
+            elif todo == "ask":
+                status = "conflict"
+            elif todo == "rename":
+                dst = free_name(dst, taken)
+                reserved.add(dst)
+                stats["renamed"] += 1
+            planned.add(dst)
+            found.append((str(sp), dst, st, status, off, kind))
             if len(found) >= self.BATCH or time.monotonic() - last >= self.EVERY:
                 flush()
         stats["excluded"] = counter[0]

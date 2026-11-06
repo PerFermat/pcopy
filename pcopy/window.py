@@ -7,6 +7,7 @@ from collections import deque
 from .qt import Qt, QtCore, QtGui, QtWidgets
 from .adding import AddMixin
 from .checker import Checker
+from .conflicts import ConflictDialog, apply as apply_conflicts
 from .db import APP_DIR, db_connect
 from .engine import Engine
 from .fontsize import FontMixin
@@ -131,7 +132,11 @@ class MainWindow(AddMixin, ListMixin, MenuMixin, FontMixin, QtWidgets.QMainWindo
             self.existing.addItem(text, key)
         self.existing.setToolTip("Was passiert, wenn es die Datei im Ziel schon gibt.\n"
                                  "Gilt für Dateien, die ab jetzt hinzugefügt werden.\n"
-                                 "„wenn neuer“: nur ersetzen, wenn die Quelle jünger ist als die Zieldatei.")
+                                 "„wenn neuer“: nur ersetzen, wenn die Quelle jünger ist als die Zieldatei.\n"
+                                 "„beide behalten“: unter neuem Namen kopieren, z. B. „Foto (2).jpg“.\n"
+                                 "„nachfragen“: vor dem Start für jede Datei entscheiden.\n"
+                                 "Bei „beide behalten“ und „nachfragen“ werden Dateien mit gleicher Größe "
+                                 "und Zeit übersprungen.")
         i = self.existing.findData(self.settings.value("existing", "skip"))
         self.existing.setCurrentIndex(max(i, 0))
         row.addWidget(self.existing)
@@ -193,6 +198,8 @@ class MainWindow(AddMixin, ListMixin, MenuMixin, FontMixin, QtWidgets.QMainWindo
 
     # ---------------------------------------------------------------- Steuerung
     def start(self):
+        if not self.decide_conflicts():
+            return
         if not self.engine.is_running() and not self.check_targets():
             return
         self.engine.verify = self.verify.isChecked()
@@ -238,6 +245,22 @@ class MainWindow(AddMixin, ListMixin, MenuMixin, FontMixin, QtWidgets.QMainWindo
         self.report.show()
         self.report.raise_()
         self.report.activateWindow()
+
+    def decide_conflicts(self, ids=None, start=True):
+        """Dateien, die es im Ziel schon gibt (Einstellung „nachfragen“), entscheiden lassen.
+        False = abgebrochen; die Einträge bleiben dann „Ziel vorhanden – ?“."""
+        if not ids and not self.db.execute("SELECT 1 FROM jobs WHERE status='conflict' LIMIT 1").fetchone():
+            return True
+        dlg = ConflictDialog(self, self.db, ids, start)
+        if not dlg.rows:
+            return True
+        if not dlg.exec():
+            return False
+        n = apply_conflicts(self.db, dlg.decisions())
+        self.model.load(self.db)
+        self.status.showMessage(f"Vorhandene Dateien: {n['overwrite']} überschreiben, {n['rename']} beide behalten, "
+                                f"{n['skip']} überspringen", 10000)
+        return True
 
     def check_targets(self):
         """Platz, 4-GB-Grenze (FAT32) und erlaubte Zeichen vor dem Start prüfen.
@@ -295,7 +318,7 @@ class MainWindow(AddMixin, ListMixin, MenuMixin, FontMixin, QtWidgets.QMainWindo
 
         rows = self.model.rows
         total = done = 0
-        n_done = n_fail = n_all = 0
+        n_done = n_fail = n_all = n_conf = 0
         wall = time.time()
         for i, r in enumerate(rows):
             if r["status"] == "failed":
@@ -307,13 +330,15 @@ class MainWindow(AddMixin, ListMixin, MenuMixin, FontMixin, QtWidgets.QMainWindo
             total += r["size"]
             done += self.model.copied(r)
             n_done += r["status"] in FINISHED or r["status"] in CHECKING
-        open_jobs = n_all - n_done                       # wartend, läuft oder noch nicht gesichert
+            n_conf += r["status"] == "conflict"
+        open_jobs = n_all - n_done - n_conf              # wartend, läuft oder noch nicht gesichert
 
         # Alles erledigt: anhalten. Später hinzugefügte Dateien warten dann auf „Start“.
         if self.engine.is_running() and not open_jobs and not self.engine.active \
                 and not self.scans and not self.engine.unsynced() and not self.engine.dirs_pending():
             self.engine.pause()
             self.status.showMessage(f"Fertig – {n_done} Dateien" + (f", {n_fail} mit Fehler" if n_fail else "")
+                                    + (f", {n_conf} vorhandene noch nicht entschieden" if n_conf else "")
                                     + ". Neue Dateien werden erst nach „Start“ kopiert. Bericht: Strg+B", 15000)
             if n_fail > self.fails_at_start:
                 self.show_report()                       # neue Fehler in diesem Durchlauf

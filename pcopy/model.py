@@ -8,7 +8,8 @@ from .util import hsize, htime
 COLS = ["Datei", "Zielordner", "Größe", "Fortschritt", "Status", "Tempo", "Rest"]
 STATUS_TXT = {"pending": "wartend", "running": "kopiert …", "done": "fertig", "failed": "Fehler",
               "skipped": "übersprungen", "written": "sichern …", "verifying": "prüft …",
-              "checking": "prüft …", "check_wait": "Prüfung wartet"}
+              "checking": "prüft …", "check_wait": "Prüfung wartet",
+              "conflict": "Ziel vorhanden – ?"}
 FINISHED = ("done", "skipped")
 CHECKING = ("check_wait", "checking")  # nachträgliche Prüfung fertiger Dateien (Rechtsklick → Prüfen)
 COPIED = FINISHED + ("written",) + CHECKING   # Daten vollständig im Ziel (written: noch nicht gesynct)
@@ -145,9 +146,11 @@ class JobModel(QtCore.QAbstractTableModel):
                     pass
             if r.get("hash") and st in FINISHED:
                 t += f"\nSHA-256: {r['hash']}\n(nach dem Kopieren von der Platte gelesen und verglichen)"
+            if st == "conflict":
+                t += "\nIm Ziel gibt es diese Datei schon – Entscheidung vor dem Start (Liste → Vorhandene Dateien entscheiden…)"
             return t + (f"\nFehler: {r['error']}" if r.get("error") else "")
         elif role == Qt.ItemDataRole.ForegroundRole and col == 4:
-            if st == "pending" and r.get("retry_at"):
+            if st == "conflict" or st == "pending" and r.get("retry_at"):
                 return QtGui.QBrush(QtGui.QColor("#d08a1c"))
             if kind == "delete" and st in ("pending", "running"):
                 return QtGui.QBrush(QtGui.QColor("#c0392b"))
@@ -166,7 +169,8 @@ class JobModel(QtCore.QAbstractTableModel):
                 return QtGui.QIcon.fromTheme("folder" if r["kind"] == "dir" else "emblem-symbolic-link")
             return QtGui.QIcon.fromTheme({"done": "dialog-ok-apply", "failed": "dialog-error", "skipped": "go-jump", "written": "document-save",
                                           "running": "go-next", "verifying": "document-preview",
-                                          "checking": "document-preview", "check_wait": "document-preview"}.get(st, "text-x-generic"))
+                                          "checking": "document-preview", "check_wait": "document-preview",
+                                          "conflict": "dialog-question"}.get(st, "text-x-generic"))
         return None
 
 

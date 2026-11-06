@@ -37,6 +37,7 @@ def db_connect(path=DB_PATH):
     if "tries" not in cols:
         c.execute("ALTER TABLE jobs ADD COLUMN tries INTEGER DEFAULT 0")   # automatische Wiederholungen
         c.execute("ALTER TABLE jobs ADD COLUMN retry_at REAL")             # frühester neuer Versuch (Unix-Zeit)
+    c.execute("CREATE INDEX IF NOT EXISTS jobs_dst ON jobs(dst)")   # „beide behalten“: ist der Name frei?
     return c
 
 

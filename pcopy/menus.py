@@ -65,6 +65,8 @@ class MenuMixin:
                               "Markierte, noch wartende Dateien auf den oben eingestellten Zielordner umstellen",
                               "Ctrl+Shift+U")
         m.addAction(self.a_retarget)
+        m.addAction(act("Vorhandene Dateien entscheiden…", "dialog-question", lambda: self.decide_conflicts(start=False),
+                        "Dateien, die es im Ziel schon gibt: überspringen, überschreiben oder beide behalten"))
         m.addSeparator()
         m.addAction(act("Liste leeren…", "edit-clear-all", self.clear_all,
                         "Alle Einträge entfernen (laufendes Kopieren wird angehalten)", "Ctrl+Shift+Del"))
@@ -145,8 +147,10 @@ class MenuMixin:
         t = self.target.text().strip()
         a_tgt = m.addAction(QtGui.QIcon.fromTheme("folder-sync"),
                             f"Zielordner aktualisieren → {t}" if t else "Zielordner aktualisieren …")
-        a_tgt.setEnabled(any(self.model.rows[self.model.idx[i]]["status"] == "pending" for i in ids))
+        a_tgt.setEnabled(any(self.model.rows[self.model.idx[i]]["status"] in ("pending", "conflict") for i in ids))
         sel = [self.model.rows[self.model.idx[i]] for i in ids]
+        a_conf = m.addAction(QtGui.QIcon.fromTheme("dialog-question"), "Vorhandene Dateien entscheiden…")
+        a_conf.setEnabled(any(r["status"] == "conflict" for r in sel))
         a_prio = m.addAction(QtGui.QIcon.fromTheme("go-top"), "Als Nächstes kopieren")
         a_prio.setEnabled(any(r["status"] == "pending" for r in sel))
         a_unprio = m.addAction(QtGui.QIcon.fromTheme("go-bottom"), "Vorrang entfernen")
@@ -174,5 +178,7 @@ class MenuMixin:
             self.model.load(self.db)
         elif chosen == a_del:
             self.remove_selected()
+        elif chosen == a_conf:
+            self.decide_conflicts([r["id"] for r in sel if r["status"] == "conflict"], start=False)
         elif chosen == a_tgt:
             self.retarget_selected()

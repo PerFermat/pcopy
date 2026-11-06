@@ -5,7 +5,7 @@ from .qt import Qt, QtWidgets
 from .db import guess_root
 from .engine import part_path
 from .model import COPIED, FINISHED
-from .scanner import keep_existing
+from .scanner import free_name, resolve
 
 
 class ListMixin:
@@ -139,7 +139,8 @@ class ListMixin:
             self.db.execute("BEGIN")
             try:
                 rows = self.db.execute(f"SELECT id,src,dst,root,offset,size FROM jobs "
-                                       f"WHERE status='pending' AND kind!='delete' AND id IN ({q})", ids).fetchall()
+                                       f"WHERE status IN ('pending','conflict') AND kind!='delete' AND id IN ({q})",
+                                       ids).fetchall()
                 for jid, src, dst, root, off, size in rows:
                     if jid in self.engine.active:
                         continue
@@ -149,12 +150,19 @@ class ListMixin:
                         continue
                     status, noff = "pending", 0
                     try:
-                        if keep_existing(mode, os.stat(src), os.stat(new)):
-                            status, noff = "skipped", size
+                        todo = resolve(mode, os.stat(src), os.stat(new))
                     except OSError:
-                        pass
+                        todo = "copy"
+                    if todo == "skip":
+                        status, noff = "skipped", size
+                    elif todo == "ask":
+                        status = "conflict"
+                    elif todo == "rename":
+                        new = free_name(new, lambda p: self.db.execute(
+                            "SELECT 1 FROM jobs WHERE dst=? LIMIT 1", (p,)).fetchone())
                     cur = self.db.execute("UPDATE OR IGNORE jobs SET dst=?, root=?, offset=?, status=?, error=NULL "
-                                          "WHERE id=? AND status='pending'", (new, target, noff, status, jid))
+                                          "WHERE id=? AND status IN ('pending','conflict')",
+                                          (new, target, noff, status, jid))
                     if not cur.rowcount:
                         conflict += 1                # gleiche Quelle → gleiches Ziel steht schon in der Liste
                         continue

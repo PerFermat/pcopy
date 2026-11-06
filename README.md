@@ -64,7 +64,14 @@ Pause, Absturz oder abgezogener Platte exakt an der richtigen Stelle weitergehen
   Prüfsummen mit niedriger CPU-Priorität, und kopierte Daten werden aus dem Seiten-Cache
   entfernt, damit große Kopien den Speicher der anderen Programme nicht verdrängen.
 - **Tempo-Begrenzung** (MB/s, gesamt), damit der Rechner nebenher flüssig bleibt.
-- **Vorhandene Zieldateien:** überspringen, überschreiben oder nur durch neuere ersetzen.
+- **Vorhandene Zieldateien:** überspringen, überschreiben, nur durch neuere ersetzen,
+  **beide behalten** (die neue Datei bekommt einen freien Namen wie `Foto (2).jpg`) oder
+  **nachfragen**: Solche Dateien stehen als „Ziel vorhanden – ?“ in der Liste, und vor dem Start
+  zeigt pcopy sie in einer Tabelle mit Größe und Datum beider Seiten (die neuere fett). Dort lässt
+  sich für markierte Dateien wählen: überspringen, überschreiben, beide behalten oder „überschreiben,
+  wenn neuer“. Später geht das über Liste → „Vorhandene Dateien entscheiden…“ oder per Rechtsklick.
+  Bei „beide behalten“ und „nachfragen“ werden Dateien mit gleicher Größe und Zeit übersprungen,
+  damit ein erneuter Lauf keine weiteren Kopien anlegt.
 - **Ziel pro Datei:** Ein neuer Zielordner gilt für danach hinzugefügte Dateien; per Rechtsklick
   → „Zielordner aktualisieren“ lassen sich wartende Dateien auf das aktuelle Ziel umstellen.
 - **Übersichtliche Liste:** optional mitlaufend; Kopien, die länger als 5 s brauchen, rücken
@@ -114,6 +121,7 @@ Die Job-Liste liegt als SQLite-Datenbank `pcopy.db` **neben dem Programm**. Eins
 | `pcopy/listops.py` | Entfernen, Leeren, erneut versuchen, Ziel umstellen |
 | `pcopy/engine.py` | Kopier-Threads, Tempo-Limit, Sichern, Prüfen, Hilfsdateien |
 | `pcopy/precheck.py` | Prüfung vor dem Start (Platz, FAT32-Grenzen) |
+| `pcopy/conflicts.py` | Vorhandene Zieldateien entscheiden (nachfragen, beide behalten) |
 | `pcopy/checker.py` | Nachträgliches Prüfen fertiger Dateien |
 | `pcopy/report.py` | Bericht (Anzeige, Text, CSV) |
 | `pcopy/devices.py` | Festplatte oder SSD erkennen, Priorität, Seiten-Cache |
