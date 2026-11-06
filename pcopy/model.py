@@ -116,6 +116,8 @@ class JobModel(QtCore.QAbstractTableModel):
                 if kind == "delete":
                     return {"pending": "wird gelöscht", "running": "löscht …",
                             "done": "gelöscht (Papierkorb)"}.get(st, STATUS_TXT.get(st, st))
+                if st == "pending" and r.get("link_wait"):
+                    return "wartet auf ersten harten Link"
                 if st == "pending" and r.get("retry_at"):
                     wait = r["retry_at"] - time.time()
                     return f"Wiederholung in {int(wait) + 1} s" if wait > 0 else f"Versuch {r['tries'] + 1} wartet"

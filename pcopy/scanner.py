@@ -156,7 +156,7 @@ class Scanner:
             gen, rid, paths, target, mode = self.req.get()
             self.idle.clear()
             stats = dict(new=0, skipped=0, dup=0, total=0, seen=0, error=None, excluded=0, delete=0, renamed=0,
-                         conflict=0)
+                         conflict=0, hardlinks=0)
             try:
                 if gen == self.gen:
                     self._scan(c, gen, rid, paths, target, mode, stats)
@@ -179,19 +179,21 @@ class Scanner:
             nonlocal found, last
             rows = []
             c.execute("BEGIN")
-            for sp, dp, st, status, off, kind in found:
+            for sp, dp, st, status, off, kind, link in found:
                 size = st.st_size if kind == "file" or (kind == "delete" and not stat.S_ISDIR(st.st_mode)) else 0
                 act = "copy" if kind == "delete" else stored
-                cur = c.execute("INSERT OR IGNORE INTO jobs(src,dst,size,mtime,offset,status,added,root,kind,action) "
-                                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                cur = c.execute("INSERT OR IGNORE INTO jobs(src,dst,size,mtime,offset,status,added,root,kind,action,"
+                                "link_src) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                                 (sp, dp, size, st.st_mtime, off if kind == "file" else 0, status, now,
-                                 str(target), kind, act))
+                                 str(target), kind, act, link))
                 if cur.rowcount:
                     rows.append(dict(id=cur.lastrowid, src=sp, dst=dp, size=size, kind=kind, action=act, prio=0,
                                      offset=off if kind == "file" else 0, status=status, error=None))
                     stats["new"] += 1
                     if kind == "delete":
                         stats["delete"] += 1
+                    elif link and status == "pending":
+                        stats["hardlinks"] += 1
                     elif status == "conflict":
                         stats["conflict"] += 1
                     elif status == "pending":
@@ -210,6 +212,7 @@ class Scanner:
         def taken(path):
             return path in planned or c.execute("SELECT 1 FROM jobs WHERE dst=? LIMIT 1", (path,)).fetchone()
 
+        inodes = {}                              # (Gerät, Inode) -> erste Quelle (harte Links)
         counter = [0]
         for sp, dp, kind in collect(paths, target, pats, counter):
             if gen != self.gen:
@@ -240,7 +243,12 @@ class Scanner:
                 reserved.add(dst)
                 stats["renamed"] += 1
             planned.add(dst)
-            found.append((str(sp), dst, st, status, off, kind))
+            link = None
+            if kind == "file" and st.st_nlink > 1:
+                # harter Link: im Ziel wieder als Link auf die erste Kopie anlegen statt doppelt kopieren
+                link = inodes.setdefault((st.st_dev, st.st_ino), str(sp))
+                link = None if link == str(sp) else link
+            found.append((str(sp), dst, st, status, off, kind, link))
             if len(found) >= self.BATCH or time.monotonic() - last >= self.EVERY:
                 flush()
         stats["excluded"] = counter[0]
@@ -257,7 +265,7 @@ class Scanner:
                         st = os.lstat(dp)
                     except OSError:
                         continue
-                    found.append((ghost, dp, st, "pending", 0, "delete"))
+                    found.append((ghost, dp, st, "pending", 0, "delete", None))
                     if len(found) >= self.BATCH:
                         flush()
         flush()

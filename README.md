@@ -42,6 +42,17 @@ Pause, Absturz oder abgezogener Platte exakt an der richtigen Stelle weitergehen
 - **Vollständige Ordner:** leere Ordner werden mitkopiert, symbolische Links als Links (auch
   Links auf Ordner und Links ins Leere), und am Ende übernimmt pcopy Zeitstempel und Rechte der
   Ordner – von innen nach außen, damit das Anlegen der Dateien sie nicht wieder verändert.
+- **Harte Links** in der Quelle werden im Ziel wieder als harte Links angelegt statt mehrfach
+  kopiert (wie `rsync -H`). Kann das Ziel keine harten Links (z. B. FAT/exFAT) oder wurde die erste
+  Datei übersprungen, wird ganz normal kopiert.
+- **Eigentümer, Gruppe und ACLs:** Rechte, ACLs und erweiterte Attribute kommen immer mit. Die
+  Gruppe wird übernommen, wenn man Mitglied ist; einen fremden Eigentümer setzen darf nur root.
+  Was das Ziel nicht kennt (FAT, NTFS), bleibt still weg.
+- **Dünn besetzte Dateien** (VM-Images, Datenbanken): Lücken bleiben Lücken, das Ziel belegt nicht
+  mehr Platz als die Quelle.
+- **Reflink:** Innerhalb eines btrfs-/XFS-Dateisystems teilt sich die Kopie die Blöcke mit der
+  Quelle – sofort fertig und ohne zusätzlichen Platz. Zurückgelesen und geprüft wird dann nicht,
+  weil es dieselben Blöcke sind.
 - **Automatisch wiederholen:** Bei vorübergehenden Fehlern (E/A-Fehler, Gerät kurz weg,
   Zeitüberschreitung, fehlgeschlagene Prüfung) bis zu 3 weitere Versuche nach 10, 30 und 60 s –
   ab dem zuletzt gesicherten Stand. Dauerhafte Fehler (Datei fehlt, keine Berechtigung, Platte

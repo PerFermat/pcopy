@@ -87,6 +87,8 @@ class AddMixin:
                 msg += f", {st['excluded']} ausgeschlossen"
             if st["skipped"]:
                 msg += f", {st['skipped']} übersprungen (im Ziel schon vorhanden)"
+            if st.get("hardlinks"):
+                msg += f", {st['hardlinks']} harte Links (werden im Ziel wieder verlinkt)"
             if st.get("renamed"):
                 msg += f", {st['renamed']} unter neuem Namen (im Ziel gab es den Namen schon)"
             if st.get("conflict"):

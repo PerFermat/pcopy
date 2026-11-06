@@ -7,12 +7,16 @@ Ablauf pro Datei:
      gesichert.
   3. Prüfen (falls eingeschaltet): Hilfsdatei aus dem Seiten-Cache werfen, von der Platte
      zurücklesen und die SHA-256 mit der beim Kopieren berechneten Prüfsumme der Quelle vergleichen.
+  Harte Links der Quelle werden im Ziel wieder als harte Links auf die erste Kopie angelegt; auf
+  btrfs/XFS wird innerhalb eines Dateisystems per Reflink kopiert (gemeinsame Blöcke, sofort fertig),
+  und Lücken dünn besetzter Dateien bleiben Lücken.
   4. Erst dann per os.replace auf den echten Namen umbenennen → unter dem echten Namen liegt
      nie eine halbe oder fehlerhafte Datei, eine ersetzte Datei bleibt bis zuletzt erhalten.
 Was beim Programmstart noch „written“ ist, war nicht sicher auf der Platte und wird neu kopiert."""
 import ctypes
 import ctypes.util
 import errno
+import fcntl
 import hashlib
 import os
 import queue
@@ -35,6 +39,9 @@ SYNC_FILES = 200          # spätestens nach so vielen kleinen Dateien syncen
 MAX_UNSYNCED_FILES = 2 * SYNC_FILES
 MAX_UNSYNCED_BYTES = 64 * 1024 * 1024
 PART_SUFFIX = ".pcopy-part"
+FICLONE = 0x40049409      # ioctl: Datei als Reflink klonen (btrfs, XFS, bcachefs …)
+HOLE = 64 * 1024          # Nullblöcke dieser Größe werden in dünn besetzten Dateien übersprungen
+ZERO = bytes(HOLE)
 RETRY_DELAYS = (10, 30, 60)   # s bis zum 2., 3., 4. Versuch bei vorübergehenden Fehlern
 # vorübergehend (z. B. USB-Reset, Netzlaufwerk hängt) – dauerhaft wären etwa ENOENT, EACCES, ENOSPC
 TRANSIENT = {errno.EIO, errno.ENXIO, errno.ENODEV, errno.ETIMEDOUT, errno.EAGAIN, errno.EBUSY,
@@ -70,6 +77,27 @@ def fsync_dir(path):
         pass                      # manche Dateisysteme (z. B. FUSE) können das nicht – dann eben nicht
     finally:
         os.close(fd)
+
+
+def copy_owner(st, path, follow=True):
+    """Eigentümer und Gruppe übernehmen. Einen fremden Eigentümer darf nur root setzen, die Gruppe
+    auch ein Mitglied – was nicht geht (oder FAT/NTFS gar nicht kennt), bleibt still wie es ist."""
+    uid = st.st_uid if os.geteuid() == 0 else -1
+    try:
+        os.chown(path, uid, st.st_gid, follow_symlinks=follow)
+    except OSError:
+        pass
+
+
+def write_sparse(fd, buf):
+    """Nullblöcke nicht schreiben, sondern überspringen – das Ziel bekommt dort eine Lücke."""
+    mv = memoryview(buf)
+    for i in range(0, len(buf), HOLE):
+        blk = mv[i:i + HOLE]
+        if blk == ZERO[:len(blk)]:
+            fd.seek(len(blk), os.SEEK_CUR)
+        else:
+            fd.write(blk)
 
 
 def part_path(dst, jid):
@@ -174,6 +202,7 @@ class Engine:
         self.rm_dirs = set()      # Quellordner verschobener Dateien – am Ende entfernen, wenn leer
         self.tlock = threading.Lock()
         self.stamping = False
+        self.no_clone = set()     # (Quell-, Ziel-Gerät), auf denen Reflink nicht geht
         threading.Thread(target=self._syncer, daemon=True).start()
 
     def alive(self):
@@ -366,7 +395,8 @@ class Engine:
         """Nächste wartende Datei übernehmen – aber keine, deren Festplatte schon beschäftigt ist:
         mehrere Kopien gleichzeitig lassen den Lesekopf springen und machen alles langsamer."""
         with self.claim_lock:
-            rows = c.execute("SELECT id,src,dst,size,mtime,offset,kind,root,action FROM jobs WHERE status='pending' "
+            rows = c.execute("SELECT id,src,dst,size,mtime,offset,kind,root,action,link_src FROM jobs "
+                             "WHERE status='pending' "
                              "AND (retry_at IS NULL OR retry_at <= ?) ORDER BY prio DESC, id LIMIT 64",
                              (time.time(),)).fetchall()
             for row in rows:
@@ -398,12 +428,13 @@ class Engine:
                     self._stamp_dirs(c)
                 stop.wait(0.5)
                 continue
-            jid, src, dst, size, mtime, offset, kind, root, action, hdds = job
+            jid, src, dst, size, mtime, offset, kind, root, action, link_src, hdds = job
             move = action == "move"
+            link = (link_src, root) if link_src and root else None
             root = root or guess_root(src, dst)
             act = Active(jid, src, dst, size)
             self.active[jid] = act
-            self.events.put((jid, {"status": "running"}))
+            self.events.put((jid, {"status": "running", "link_wait": False}))
             try:
                 if kind == "dir":
                     result, digest = self._mkdir(c, act, move)
@@ -412,8 +443,13 @@ class Engine:
                 elif kind == "delete":
                     result, digest = self._delete(c, act, root)
                 else:
-                    result, digest = self._copy(c, act, mtime, offset, stop, move)
-                if result:
+                    result, digest = self._copy(c, act, mtime, offset, stop, move, link)
+                if result == "wait":
+                    # harter Link: die erste Datei wird noch kopiert – gleich noch einmal versuchen
+                    at = time.time() + 1
+                    c.execute("UPDATE jobs SET status='pending', retry_at=? WHERE id=?", (at, jid))
+                    self.events.put((jid, {"status": "pending", "retry_at": at, "link_wait": True}))
+                elif result:
                     self._touch(src, dst, root, kind, move)
                     self.events.put((jid, {"status": result, "offset": act.size, "size": act.size, "error": None,
                                            "speed": act.avg, "hash": digest, "retry_at": None,
@@ -466,6 +502,7 @@ class Engine:
                 gone, self.rm_dirs = self.rm_dirs, set()
             for dd in sorted(pairs, key=lambda p: p.count(os.sep), reverse=True):
                 try:
+                    copy_owner(os.stat(pairs[dd]), dd)
                     shutil.copystat(pairs[dd], dd)
                 except OSError:
                     pass                           # z. B. FAT: keine Rechte – Zeiten sind dann trotzdem gesetzt
@@ -524,6 +561,7 @@ class Engine:
             os.remove(tmp)
         os.symlink(target, tmp)
         st = os.lstat(act.src)
+        copy_owner(st, tmp, follow=False)
         try:
             os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns), follow_symlinks=False)
         except (OSError, NotImplementedError):
@@ -560,7 +598,53 @@ class Engine:
             kw["offset"] = (c.execute("SELECT offset FROM jobs WHERE id=?", (jid,)).fetchone() or [0])[0]
         self.events.put((jid, kw))
 
-    def _copy(self, c, act, mtime, offset, stop, move=False):
+    def _hardlink(self, c, act, link, move):
+        """Harter Link in der Quelle: im Ziel auf die schon kopierte erste Datei verlinken.
+        Rückgabe wie _copy; („wait“, None), solange die erste noch kopiert wird; None = normal kopieren
+        (erste Datei übersprungen/fehlerhaft, Ziel kann keine harten Links, anderes Laufwerk …)."""
+        link_src, root = link
+        row = c.execute("SELECT status,dst,size,hash FROM jobs WHERE src=? AND root=? ORDER BY id LIMIT 1",
+                        (link_src, root)).fetchone()
+        if row is None or row[0] not in ("done", "pending", "running", "written"):
+            return None
+        status, first, size, digest = row
+        if status != "done":
+            return "wait", None
+        try:
+            if size != act.size or os.stat(first).st_size != act.size:
+                return None                      # inzwischen geändert – dann lieber echt kopieren
+            os.makedirs(os.path.dirname(act.dst), exist_ok=True)
+            tmp = part_path(act.dst, act.id)
+            if os.path.lexists(tmp):
+                os.remove(tmp)
+            os.link(first, tmp)
+        except OSError:
+            return None
+        os.replace(tmp, act.dst)
+        fsync_dir(os.path.dirname(act.dst))
+        act.copied = act.size
+        c.execute("UPDATE jobs SET status='done', offset=size, error=NULL, hash=?, tries=0, retry_at=NULL "
+                  "WHERE id=?", (digest, act.id))
+        if move:
+            self._remove_source(c, act)
+        return "done", digest
+
+    def _clone(self, src, part):
+        """Reflink: Ziel teilt sich die Blöcke mit der Quelle (btrfs, XFS …). True, wenn es ging."""
+        key = (self.devices.dev(src), self.devices.dev(part))
+        if key in self.no_clone:
+            return False
+        try:
+            with open(src, "rb") as fs, open(part, "wb") as fd:
+                fcntl.ioctl(fd.fileno(), FICLONE, fs.fileno())
+                os.fsync(fd.fileno())
+            return True
+        except OSError as e:
+            if e.errno in (errno.EOPNOTSUPP, errno.ENOTTY, errno.EXDEV, errno.EINVAL, errno.ENOSYS):
+                self.no_clone.add(key)           # geht hier grundsätzlich nicht – nicht jedes Mal probieren
+            return False
+
+    def _copy(self, c, act, mtime, offset, stop, move=False, link=None):
         """Rückgabe (status, sha256) mit status „done“/„written“, oder (None, None) bei Pause."""
         if move and self.devices.dev(act.src) == self.devices.dev(act.dst) >= 0:
             # Verschieben auf demselben Laufwerk: umbenennen genügt – sofort, ohne Kopie
@@ -580,6 +664,10 @@ class Engine:
         if st.st_size != act.size or abs(st.st_mtime - mtime) > 1e-3:
             offset, act.size = 0, st.st_size        # Quelle geändert -> neu
             c.execute("UPDATE jobs SET size=?, mtime=?, offset=0 WHERE id=?", (st.st_size, st.st_mtime, act.id))
+        if link and offset == 0:
+            r = self._hardlink(c, act, link, move)
+            if r is not None:
+                return r
         small = act.size < SMALL
         os.makedirs(os.path.dirname(act.dst), exist_ok=True)
         part = part_path(act.dst, act.id)
@@ -589,70 +677,86 @@ class Engine:
         h = hashlib.sha256() if self.verify or move else None   # Verschieben: immer prüfen
 
         def pause(fd):
+            if sparse:
+                fd.truncate()
             fd.flush(); os.fsync(fd.fileno())
             c.execute("UPDATE jobs SET status='pending', offset=? WHERE id=?", (act.copied, act.id))
             return None, None
 
-        with open(act.src, "rb") as fs, open(part, "r+b" if offset else "wb") as fd:
-            fd.truncate(offset)
-            if h is not None and offset:
-                # Fortsetzung: Prüfsumme braucht auch den schon kopierten Anfang der Quelle
-                while fs.tell() < offset:
+        # Reflink (btrfs/XFS, gleiches Dateisystem): sofort fertig, die Daten sind dieselben Blöcke –
+        # deshalb auch kein Zurücklesen zum Prüfen
+        cloned = offset == 0 and self._clone(act.src, part)
+        # dünn besetzte Quelle (VM-Image, Datenbank …): Nullblöcke als Lücken anlegen
+        sparse = st.st_blocks * 512 < st.st_size
+        if cloned:
+            h, t0 = None, time.monotonic()
+            act.copied = act.size
+        else:
+            with open(act.src, "rb") as fs, open(part, "r+b" if offset else "wb") as fd:
+                fd.truncate(offset)
+                if h is not None and offset:
+                    # Fortsetzung: Prüfsumme braucht auch den schon kopierten Anfang der Quelle
+                    while fs.tell() < offset:
+                        if stop.is_set():
+                            return pause(fd)
+                        h.update(fs.read(min(CHUNK, offset - fs.tell())))
+                fs.seek(offset)
+                fd.seek(offset)
+                gentle = self.gentle
+                if gentle:
+                    try:
+                        os.posix_fadvise(fs.fileno(), 0, 0, os.POSIX_FADV_SEQUENTIAL)
+                    except (AttributeError, OSError):
+                        pass
+                t0 = last = time.monotonic()
+                act.samples.append((last, offset))   # Startpunkt: Tempo schon nach dem ersten Block
+                while True:
                     if stop.is_set():
                         return pause(fd)
-                    h.update(fs.read(min(CHUNK, offset - fs.tell())))
-            fs.seek(offset)
-            fd.seek(offset)
-            gentle = self.gentle
-            if gentle:
-                try:
-                    os.posix_fadvise(fs.fileno(), 0, 0, os.POSIX_FADV_SEQUENTIAL)
-                except (AttributeError, OSError):
-                    pass
-            t0 = last = time.monotonic()
-            act.samples.append((last, offset))   # Startpunkt: Tempo schon nach dem ersten Block
-            while True:
-                if stop.is_set():
-                    return pause(fd)
-                # nur so viel beim Tempo-Limit anmelden, wie von der Datei noch übrig ist –
-                # sonst blockiert eine 5-KB-Datei die anderen Worker für einen ganzen Block
-                size = min(self.throttle.chunk(), act.size - act.copied)
-                if size <= 0:
-                    break
-                self.throttle.wait(size, stop)
-                if stop.is_set():
-                    continue
-                buf = fs.read(size)
-                self.throttle.refund(size - len(buf))
-                if not buf:
-                    break                            # Quelle während des Kopierens geschrumpft
-                fd.write(buf)
-                if h is not None:
-                    h.update(buf)
-                if gentle:
-                    drop_cache(fs.fileno(), act.copied, len(buf))   # Quelle: gelesen = nicht mehr nötig
-                act.copied += len(buf)
-                now = time.monotonic()
-                act.samples.append((now, act.copied))
-                if now - last >= SYNC_EVERY:
-                    fd.flush(); os.fsync(fd.fileno())
+                    # nur so viel beim Tempo-Limit anmelden, wie von der Datei noch übrig ist –
+                    # sonst blockiert eine 5-KB-Datei die anderen Worker für einen ganzen Block
+                    size = min(self.throttle.chunk(), act.size - act.copied)
+                    if size <= 0:
+                        break
+                    self.throttle.wait(size, stop)
+                    if stop.is_set():
+                        continue
+                    buf = fs.read(size)
+                    self.throttle.refund(size - len(buf))
+                    if not buf:
+                        break                            # Quelle während des Kopierens geschrumpft
+                    (write_sparse(fd, buf) if sparse else fd.write(buf))
+                    if h is not None:
+                        h.update(buf)
                     if gentle:
-                        drop_cache(fd.fileno())                  # Ziel: gesichert = aus dem Cache
+                        drop_cache(fs.fileno(), act.copied, len(buf))   # Quelle: gelesen = nicht mehr nötig
+                    act.copied += len(buf)
+                    now = time.monotonic()
+                    act.samples.append((now, act.copied))
+                    if now - last >= SYNC_EVERY:
+                        if sparse:
+                            fd.truncate()                    # Lücke am Ende: Länge stimmt trotzdem
+                        fd.flush(); os.fsync(fd.fileno())
+                        if gentle:
+                            drop_cache(fd.fileno())                  # Ziel: gesichert = aus dem Cache
+                        c.execute("UPDATE jobs SET offset=? WHERE id=?", (act.copied, act.id))
+                        last = now
+                if sparse:
+                    fd.truncate()
+                fd.flush()
+                if not small:
+                    os.fsync(fd.fileno())
+                    if gentle:
+                        drop_cache(fd.fileno())
+                    # alles sicher auf der Platte: Stand sichern, damit ein späterer Fehler (Prüfen,
+                    # Umbenennen …) beim nächsten Versuch nicht wieder alles kopieren muss
                     c.execute("UPDATE jobs SET offset=? WHERE id=?", (act.copied, act.id))
-                    last = now
-            fd.flush()
-            if not small:
-                os.fsync(fd.fileno())
-                if gentle:
-                    drop_cache(fd.fileno())
-                # alles sicher auf der Platte: Stand sichern, damit ein späterer Fehler (Prüfen,
-                # Umbenennen …) beim nächsten Versuch nicht wieder alles kopieren muss
-                c.execute("UPDATE jobs SET offset=? WHERE id=?", (act.copied, act.id))
         took = time.monotonic() - t0                 # große Dateien: inkl. abschließendem fsync
         moved = act.copied - act.base                # bei Fortsetzung: nur der Teil dieser Sitzung
-        act.avg = moved / took if moved and took > 0 else None
+        act.avg = moved / took if moved and took > 0 and not cloned else None
         digest = h.hexdigest() if h is not None else None
-        shutil.copystat(act.src, part)               # Zeiten/Rechte gehen beim Umbenennen mit
+        copy_owner(st, part)                         # vor copystat: chown löscht Set-UID-Bits
+        shutil.copystat(act.src, part)               # Zeiten/Rechte/ACLs gehen beim Umbenennen mit
 
         if small:
             # Versuchszähler bleibt, bis die Datei gesichert und geprüft ist (flush)
