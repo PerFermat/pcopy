@@ -338,6 +338,9 @@ class MainWindow(AddMixin, ListMixin, MenuMixin, FontMixin, QtWidgets.QMainWindo
         self.l_bytes.setText(f"{hsize(done)} / {hsize(total)}")
         self.l_speed.setText(f"{hsize(speed)}/s" if running else "–")
         self.l_eta.setText(htime((total - done) / speed) if running and speed else "–")
+        unsynced = self.engine.unsynced()
+        if running and unsynced and not actives:     # Worker warten, bis das Ziel nachkommt
+            self.status.showMessage(f"Ziel sichert und prüft noch {unsynced} Dateien …", 2000)
 
         # „Gleichzeitig“ verkleinert: Angefangenes läuft zu Ende, Neues startet erst danach
         n_act, n_max = len(self.engine.active), self.engine.n

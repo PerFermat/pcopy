@@ -29,6 +29,11 @@ CHUNK = 1024 * 1024
 SYNC_EVERY = 2.0          # s: Stand großer Dateien sichern / kleine Dateien gesammelt syncen
 SMALL = 8 * 1024 * 1024   # kleiner als das: kein fsync pro Datei, sondern gesammelt
 SYNC_FILES = 200          # spätestens nach so vielen kleinen Dateien syncen
+# Höchstens so viel ungesichert im Seiten-Cache, sonst warten die Worker. Ohne diese Bremse
+# „kopiert“ ein langsames Ziel (USB-Stick) gigabyteweise in den Speicher und hängt dann minutenlang
+# beim Sichern – ohne Fortschritt in der Anzeige.
+MAX_UNSYNCED_FILES = 2 * SYNC_FILES
+MAX_UNSYNCED_BYTES = 64 * 1024 * 1024
 PART_SUFFIX = ".pcopy-part"
 RETRY_DELAYS = (10, 30, 60)   # s bis zum 2., 3., 4. Versuch bei vorübergehenden Fehlern
 # vorübergehend (z. B. USB-Reset, Netzlaufwerk hängt) – dauerhaft wären etwa ENOENT, EACCES, ENOSPC
@@ -160,6 +165,9 @@ class Engine:
         self.n = 4
         self.written = []         # kleine Dateien, die noch gesynct/geprüft/umbenannt werden müssen
         self.written_since = None
+        self.written_bytes = 0    # Größe der Dateien in `written`
+        self.syncing = 0          # Dateien, die flush() gerade sichert und prüft
+        self.syncing_bytes = 0
         self.wlock = threading.Lock()
         self.sync_lock = threading.Lock()
         self.touched = {}         # Zielordner -> Quellordner, deren Zeitstempel am Ende gesetzt werden
@@ -248,8 +256,21 @@ class Engine:
 
     # ---------------------------------------------------------------- gesammeltes Sichern
     def unsynced(self):
+        """Kleine Dateien, die kopiert, aber noch nicht gesichert/geprüft/umbenannt sind."""
         with self.wlock:
-            return len(self.written)
+            return len(self.written) + self.syncing
+
+    def _backlog_full(self):
+        with self.wlock:
+            return (len(self.written) + self.syncing >= MAX_UNSYNCED_FILES or
+                    self.written_bytes + self.syncing_bytes >= MAX_UNSYNCED_BYTES)
+
+    def _add_written(self, entry, size):
+        with self.wlock:
+            self.written.append(entry)
+            self.written_bytes += size
+            if self.written_since is None:
+                self.written_since = time.monotonic()
 
     def _syncer(self):
         lower_priority()
@@ -277,50 +298,58 @@ class Engine:
         with self.sync_lock:
             with self.wlock:
                 batch, self.written, self.written_since = self.written, [], None
+                self.syncing, self.syncing_bytes = len(batch), self.written_bytes
+                self.written_bytes = 0
             if not batch:
                 return
-            c = c or db_connect()
-            ok, bad = [], []                     # bad: (jid, part, fehlertext, wiederholen?)
             try:
-                self._sync_dirs(p for _, p, _, _, _ in batch)        # Daten sicher auf der Platte
-                for jid, part, dst, digest, _ in batch:
-                    try:
-                        if self.gentle and digest is None:
-                            with open(part, "rb") as f:
-                                drop_cache(f.fileno())
-                        if digest is not None and not self._verify(part, digest):
-                            bad.append((jid, part, "Prüfung fehlgeschlagen: Ziel weicht von der Quelle ab", True))
-                            continue
-                        os.replace(part, dst)
-                        ok.append(jid)
-                    except OSError as e:
-                        bad.append((jid, part, e.strerror or str(e), e.errno in TRANSIENT))
-                if ok:
-                    done = set(ok)
-                    self._sync_dirs(dst for jid, _, dst, _, _ in batch if jid in done)    # Umbenennungen
-            except OSError as e:
-                # nicht sicher geschrieben -> neu kopieren (bei vorübergehenden Fehlern später erneut)
-                for jid, _, _, _, _ in batch:
-                    self._fail(c, jid, f"Sichern fehlgeschlagen: {e.strerror or e}",
-                               retry=e.errno in TRANSIENT, restart=True)
-                return
-            c.execute("BEGIN")
-            c.executemany("UPDATE jobs SET status='done', tries=0, retry_at=NULL WHERE id=? AND status='written'",
-                          [(j,) for j in ok])
-            c.execute("COMMIT")
-            for jid in ok:
-                self.events.put((jid, {"status": "done", "tries": 0, "retry_at": None}))
-            ok_set = set(ok)
-            moved = {jid: src for jid, _, _, _, src in batch if src and jid in ok_set}
-            for jid, src in moved.items():                                     # Verschieben: Quelle weg
-                act = Active(jid, src, "", 0)
-                self._remove_source(c, act)
-            for jid, part, msg, retry in bad:
+                self._flush(batch, c or db_connect())
+            finally:
+                with self.wlock:
+                    self.syncing = self.syncing_bytes = 0
+
+    def _flush(self, batch, c):
+        ok, bad = [], []                     # bad: (jid, part, fehlertext, wiederholen?)
+        try:
+            self._sync_dirs(p for _, p, _, _, _ in batch)        # Daten sicher auf der Platte
+            for jid, part, dst, digest, _ in batch:
                 try:
-                    os.remove(part)
-                except OSError:
-                    pass
-                self._fail(c, jid, msg, retry=retry, restart=True)
+                    if self.gentle and digest is None:
+                        with open(part, "rb") as f:
+                            drop_cache(f.fileno())
+                    if digest is not None and not self._verify(part, digest):
+                        bad.append((jid, part, "Prüfung fehlgeschlagen: Ziel weicht von der Quelle ab", True))
+                        continue
+                    os.replace(part, dst)
+                    ok.append(jid)
+                except OSError as e:
+                    bad.append((jid, part, e.strerror or str(e), e.errno in TRANSIENT))
+            if ok:
+                done = set(ok)
+                self._sync_dirs(dst for jid, _, dst, _, _ in batch if jid in done)    # Umbenennungen
+        except OSError as e:
+            # nicht sicher geschrieben -> neu kopieren (bei vorübergehenden Fehlern später erneut)
+            for jid, _, _, _, _ in batch:
+                self._fail(c, jid, f"Sichern fehlgeschlagen: {e.strerror or e}",
+                           retry=e.errno in TRANSIENT, restart=True)
+            return
+        c.execute("BEGIN")
+        c.executemany("UPDATE jobs SET status='done', tries=0, retry_at=NULL WHERE id=? AND status='written'",
+                      [(j,) for j in ok])
+        c.execute("COMMIT")
+        for jid in ok:
+            self.events.put((jid, {"status": "done", "tries": 0, "retry_at": None}))
+        ok_set = set(ok)
+        moved = {jid: src for jid, _, _, _, src in batch if src and jid in ok_set}
+        for jid, src in moved.items():                                     # Verschieben: Quelle weg
+            act = Active(jid, src, "", 0)
+            self._remove_source(c, act)
+        for jid, part, msg, retry in bad:
+            try:
+                os.remove(part)
+            except OSError:
+                pass
+            self._fail(c, jid, msg, retry=retry, restart=True)
 
     def session_bytes(self):
         with self.flock:
@@ -360,6 +389,9 @@ class Engine:
             lower_priority()
         c = db_connect()
         while not stop.is_set() and nr < self.n:
+            if self._backlog_full():
+                stop.wait(0.1)                   # erst muss das Ziel das Geschriebene sichern
+                continue
             job = self._claim(c)
             if not job:
                 if nr == 0:
@@ -386,6 +418,8 @@ class Engine:
                     self.events.put((jid, {"status": result, "offset": act.size, "size": act.size, "error": None,
                                            "speed": act.avg, "hash": digest, "retry_at": None,
                                            **({"tries": 0} if result == "done" else {})}))
+                    if result == "written":
+                        self._add_written(act.written, act.size)
                 else:
                     self.events.put((jid, {"status": "pending", "offset": act.copied, "size": act.size}))
             except VerifyError as e:
@@ -625,10 +659,9 @@ class Engine:
             c.execute("UPDATE jobs SET status='written', offset=size, error=NULL, speed=?, hash=?, retry_at=NULL "
                       "WHERE id=?",
                       (act.avg, digest, act.id))
-            with self.wlock:
-                self.written.append((act.id, part, act.dst, digest, act.src if move else None))
-                if self.written_since is None:
-                    self.written_since = time.monotonic()
+            # in die Sicher-Liste erst nach der Meldung „written“ an die Anzeige (siehe _worker) –
+            # sonst kann das „done“ von flush() vorher ankommen und wird überschrieben
+            act.written = (act.id, part, act.dst, digest, act.src if move else None)
             return "written", digest
 
         # große Datei (Stand ist gesichert): Abbruch beim Prüfen → beim Fortsetzen nur noch prüfen
